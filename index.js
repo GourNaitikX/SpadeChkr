@@ -217,7 +217,7 @@ async function processCard(ccInput, rawProxy) {
       "&cc=" + ccInput.trim() +
       "&proxy=" + proxyParam;
     const res = await axios.get(apiUrl, {
-      timeout: 25000,
+      timeout: 40000,
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json",
