@@ -214,9 +214,8 @@ async function processCard(ccInput, rawProxy) {
     // CORRECT API URL FORMAT
     const apiUrl = apiBase +
       "?site=" + encodeURIComponent(site) +
-      "&cc=" + encodeURIComponent(ccInput) +
-      "&proxy=" + encodeURIComponent(proxyParam);
-
+      "&cc=" + ccInput.trim() +
+      "&proxy=" + proxyParam;
     const res = await axios.get(apiUrl, {
       timeout: 25000,
       headers: {
